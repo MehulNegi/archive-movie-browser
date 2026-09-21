@@ -1,6 +1,30 @@
 # Changelog
 
+All notable changes to this project are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com), newest first.
+
 ## [Unreleased]
+
+### Added
+
+- Our own film player: arrow keys skip 10 s (Shift: a minute), Space pauses, F is full screen, M mutes, Escape closes, and a film resumes where you left it. Archive.org's player remains the fallback ([#137](https://github.com/amponce/archive-movie-browser/pull/137)).
+- An MCP server for the catalogue, run locally ([#112](https://github.com/amponce/archive-movie-browser/pull/112)) or hosted at `/api/mcp` ([#133](https://github.com/amponce/archive-movie-browser/pull/133)), with a page explaining it ([#130](https://github.com/amponce/archive-movie-browser/pull/130)).
+- Decade filter, 1910s to 2020s ([#128](https://github.com/amponce/archive-movie-browser/pull/128), [#132](https://github.com/amponce/archive-movie-browser/pull/132)).
+- Paste an Archive.org link into the search box to open it here ([#136](https://github.com/amponce/archive-movie-browser/pull/136)).
+- Search suggestions include the tags uploaders use ([#138](https://github.com/amponce/archive-movie-browser/pull/138)).
+- Search from the film page without going back ([#139](https://github.com/amponce/archive-movie-browser/pull/139)), and clear recent searches ([#140](https://github.com/amponce/archive-movie-browser/pull/140)).
+- Grid or list view is remembered between visits ([#110](https://github.com/amponce/archive-movie-browser/pull/110)).
+- A security policy with private vulnerability reporting ([#113](https://github.com/amponce/archive-movie-browser/pull/113)).
+
+### Changed
+
+- Release-date sorts leave out dates that are really upload dates, so "newest" is truthful ([#128](https://github.com/amponce/archive-movie-browser/pull/128), [#132](https://github.com/amponce/archive-movie-browser/pull/132)).
+- Most Popular shows films with a real poster first ([#132](https://github.com/amponce/archive-movie-browser/pull/132)).
+
+### Fixed
+
+- Top Rated (TMDB) no longer reshuffles cards as ratings arrive, and Load more adds films in place ([#127](https://github.com/amponce/archive-movie-browser/pull/127)).
+- Trailers and clips no longer appear under Full Movies ([#128](https://github.com/amponce/archive-movie-browser/pull/128), [#129](https://github.com/amponce/archive-movie-browser/pull/129)).
+- On phones, the selected genre scrolls into view ([#125](https://github.com/amponce/archive-movie-browser/pull/125)).
 
 ## [1.2.0] - 2026-09-21
 
@@ -39,7 +63,7 @@
 ### Fixed
 
 - Improved matching of messy Archive.org upload titles to films ([#59](https://github.com/amponce/archive-movie-browser/pull/59)).
-- Improved TMDB request handling and caching ([#56](https://github.com/amponce/archive-movie-browser/pull/56), [#96](https://github.com/amponce/archive-movie-browser/pull/96)).
+- Improved TMDB request handling and caching ([#56](https://github.com/amponce/archive-movie-browser/pull/56)).
 - Fixed detail-page posters and movie accessibility issues ([#71](https://github.com/amponce/archive-movie-browser/pull/71)).
 
 ## [1.0.0] - 2026-09-20

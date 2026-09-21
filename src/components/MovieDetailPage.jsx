@@ -16,6 +16,8 @@ import {
 import tmdbService from '../services/tmdb';
 import archiveService from '../services/archive';
 import TitleCover from './TitleCover';
+import FilmPlayer from './FilmPlayer';
+import SearchBox from './SearchBox';
 
 // Sub-component for related movies with TMDB poster support
 function RelatedMovieCard({ movie, onClick }) {
@@ -73,7 +75,8 @@ function RelatedMovieCard({ movie, onClick }) {
   );
 }
 
-export default function MovieDetailPage({ movie, onClose, allMovies = [], onPlayRelated }) {
+export default function MovieDetailPage({ movie, onClose, allMovies = [], onPlayRelated, onSearch, onPickGenre, onPickCollection }) {
+  const [searchText, setSearchText] = useState('');
   const [tmdbData, setTmdbData] = useState(null);
   const [tmdbDetails, setTmdbDetails] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -230,7 +233,6 @@ export default function MovieDetailPage({ movie, onClose, allMovies = [], onPlay
 
   if (!movie) return null;
 
-  const embedUrl = `https://archive.org/embed/${movie.identifier}`;
   const posterUrl = tmdbData?.posterPath
     ? tmdbService.getPosterUrl(tmdbData.posterPath, 'large')
     : null;
@@ -266,23 +268,40 @@ export default function MovieDetailPage({ movie, onClose, allMovies = [], onPlay
 
       {/* Header */}
       <div className="sticky top-0 z-10 bg-gray-900/90 backdrop-blur border-b border-gray-800">
-        <div className="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between">
+        <div className="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between gap-3">
           <button
             ref={backButtonRef}
             onClick={() => window.history.back()}
-            className="flex items-center gap-2 text-gray-400 hover:text-white transition-colors"
+            aria-label="Back to Browse"
+            className="flex items-center gap-2 text-gray-400 hover:text-white transition-colors flex-shrink-0"
           >
             <ChevronLeft className="w-5 h-5" />
-            <span>Back to Browse</span>
+            <span className="hidden md:inline">Back to Browse</span>
           </button>
+
+          {/* Search again without going back: a film opens here, anything else returns to the list */}
+          {onSearch && (
+            <div className="flex-1 flex max-w-2xl">
+              <SearchBox
+                value={searchText}
+                onChange={setSearchText}
+                onSearch={(text) => text.trim() && onSearch(text)}
+                onOpenFilm={(film) => { setSearchText(''); onPlayRelated(film); }}
+                onPickGenre={onPickGenre}
+                onPickCollection={onPickCollection}
+                movies={allMovies}
+              />
+            </div>
+          )}
 
           <a
             href={movie.archiveUrl}
             target="_blank"
             rel="noopener noreferrer"
-            className="flex items-center gap-2 text-sm text-gray-400 hover:text-yellow-400"
+            aria-label="View on Archive.org"
+            className="flex items-center gap-2 text-sm text-gray-400 hover:text-yellow-400 flex-shrink-0"
           >
-            View on Archive.org
+            <span className="hidden md:inline">View on Archive.org</span>
             <ExternalLink className="w-4 h-4" />
           </a>
         </div>
@@ -467,15 +486,11 @@ export default function MovieDetailPage({ movie, onClose, allMovies = [], onPlay
               </button>
             </div>
             <div className="relative aspect-video bg-black rounded-lg overflow-hidden shadow-2xl">
-              <iframe
-                src={embedUrl}
-                className="absolute inset-0 w-full h-full"
-                frameBorder="0"
-                allowFullScreen
-                allow="autoplay; fullscreen"
-                title={movie.title}
-              />
+              <FilmPlayer movie={movie} />
             </div>
+            <p className="mt-2 text-xs text-gray-500">
+              Keyboard: ← → skip 10 seconds (hold Shift for a minute), Space pauses, F is full screen, M mutes, Esc closes.
+            </p>
           </div>
         )}
 

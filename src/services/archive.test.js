@@ -24,8 +24,8 @@ test('getMovieByIdentifier normalizes Archive.org metadata', async () => {
     const movie = await archiveService.getMovieByIdentifier('example-film');
     assert.deepEqual(movie, {
       id: 'example-film', identifier: 'example-film', title: 'Example Film',
-      year: 1954, runtimeMinutes: 90, runtime: '1:30:00', genres: ['Drama', 'Sci-Fi'],
-      downloads: 42, rating: null, description: 'A test movie.', creator: 'Test Director',
+      year: 1954, runtimeMinutes: 90, runtime: '1:30:00', genres: ['Drama', 'Sci-Fi'], tags: ['science fiction', 'Drama'],
+      downloads: 42, sizeMB: null, rating: null, description: 'A test movie.', creator: 'Test Director',
       archiveUrl: 'https://archive.org/details/example-film',
       thumbnailUrl: 'https://archive.org/services/img/example-film',
       embedUrl: 'https://archive.org/embed/example-film', date: '1954-01-01', publicDate: undefined
@@ -482,14 +482,14 @@ test('a film year comes from the title first, and an upload-year value counts as
   }
 });
 
-test('buildSuggestQuery matches word prefixes in titles across the film collections', () => {
+test('buildSuggestQuery matches word prefixes in titles and tags across the film collections', () => {
   const query = archiveService.buildSuggestQuery('Haun hou');
-  assert.equal(query, 'collection:(feature_films OR moviesandfilms OR Film_Noir OR SciFi_Horror OR silent_films) AND title:(haun* AND hou*) AND NOT mediatype:collection');
+  assert.equal(query, 'collection:(feature_films OR moviesandfilms OR Film_Noir OR SciFi_Horror OR silent_films) AND (title:(haun* AND hou*) OR subject:(haun* AND hou*)) AND NOT mediatype:collection');
   assert.equal(archiveService.buildSuggestQuery('a'), null, 'too short to be worth a request');
   assert.equal(archiveService.buildSuggestQuery('"" ()'), null);
 });
 
-test('suggestTitles returns a few distinct films and can be cancelled without retrying', async () => {
+test('suggest returns a few distinct films and can be cancelled without retrying', async () => {
   const realFetch = globalThis.fetch;
   try {
     mockDocs([
@@ -497,13 +497,119 @@ test('suggestTitles returns a few distinct films and can be cancelled without re
       { identifier: 'n2', title: 'Nosferatu_DVD_quality', year: '1922', downloads: 800 },
       { identifier: 'n3', title: 'Nosferatu the Vampyre', year: '1979', downloads: 700 },
     ]);
-    const films = await archiveService.suggestTitles('nosf');
+    const { films } = await archiveService.suggest('nosf');
     assert.deepEqual(films.map(f => f.identifier), ['n1', 'n3'], 're-uploads of one film collapse into one suggestion');
 
     let calls = 0;
     globalThis.fetch = async (url, { signal } = {}) => { calls++; const e = new Error('aborted'); e.name = 'AbortError'; throw e; };
-    await assert.rejects(() => archiveService.suggestTitles('dracula', { signal: new AbortController().signal }), { name: 'AbortError' });
+    await assert.rejects(() => archiveService.suggest('dracula', { signal: new AbortController().signal }), { name: 'AbortError' });
     assert.equal(calls, 1, 'a cancelled request is not retried');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('Full Movies drops trailers that have no runtime, but not films that come with trailers', async () => {
+  const { runtimeFilter } = await import('./archive.js');
+  const full = runtimeFilter({ minRuntime: 40 });
+  // Real titles from Movies & Films; none of them has a runtime recorded
+  assert.equal(full({ runtimeMinutes: 0, title: 'Night of the living dead Trailer' }), false);
+  assert.equal(full({ runtimeMinutes: 0, title: 'Sita Sings the Blues Trailer 2008 - 640x360' }), false);
+  assert.equal(full({ runtimeMinutes: 0, title: 'Psycho (1960) teaser' }), false);
+  assert.equal(full({ runtimeMinutes: 0, title: 'Wheels On Meals aka Spartan X (1984) with Trailers' }), true);
+  assert.equal(full({ runtimeMinutes: 0, title: 'Armour Of God & Operation Condor (& Trailers)' }), true);
+  assert.equal(full({ runtimeMinutes: 0, title: 'Escape From Sobibor' }), true);
+  assert.equal(full({ runtimeMinutes: 95, title: 'Trailer Park of Terror' }), true, 'a known runtime decides on its own');
+  assert.equal(runtimeFilter({ shorts: true })({ runtimeMinutes: 0, title: 'Night of the living dead Trailer' }), true, 'Shorts is where trailers belong');
+});
+
+test('buildQuery: a decade matches a release date in it, or a year from it in the title', () => {
+  const query = archiveService.buildQuery({ collection: 'feature_films', decade: 1980 });
+  assert.match(query, /AND \(\(date:\[1980-01-01 TO 1989-12-31\]\) OR title:\(1980 OR 1981 OR 1982 OR 1983 OR 1984 OR 1985 OR 1986 OR 1987 OR 1988 OR 1989\)\)/);
+  assert.doesNotMatch(archiveService.buildQuery({ collection: 'feature_films' }), /date:/);
+  assert.doesNotMatch(archiveService.buildQuery({ collection: 'feature_films', decade: 'abc' }), /date:/, 'junk from a URL is ignored');
+});
+
+test('buildQuery: sorting by release date leaves out dates that are really upload dates', () => {
+  // Uploaders leave "date" at the upload date (Drunken Master, 1978, was dated 2026), or a year
+  // before it. A date before 2000 cannot be one: nothing was uploaded to Archive.org that early.
+  const query = archiveService.buildQuery({ collection: 'feature_films', dated: true });
+  assert.match(query, /AND date:\[1880-01-01 TO \d{4}-12-31\] AND NOT \(\(year:2000 AND publicdate:\[2000-01-01 TO 2001-12-31\]\) OR /);
+  assert.match(query, new RegExp(`year:${new Date().getFullYear()} AND publicdate`), 'covers the current year');
+  assert.doesNotMatch(query, /year:1999 AND/);
+  assert.ok(encodeURIComponent(query).length < 3000, 'Archive.org rejects much longer queries');
+  // Within a decade, a year that is only in the title has an upload date, which would sort first
+  const nineties = archiveService.buildQuery({ collection: 'feature_films', dated: true, decade: 1990 });
+  assert.match(nineties, /AND date:\[1990-01-01 TO 1999-12-31\]/);
+  assert.doesNotMatch(nineties, /title:\(1990|publicdate/);
+});
+
+test('buildQuery: decades from 2000 on only trust a date that is not the upload date', () => {
+  const query = archiveService.buildQuery({ collection: 'feature_films', decade: 2000 });
+  assert.match(query, /\(\(date:\[2000-01-01 TO 2009-12-31\] AND NOT \(\(year:2000 AND publicdate:\[2000-01-01 TO 2001-12-31\]\) OR .*year:2009 AND publicdate:\[2009-01-01 TO 2010-12-31\]\)\)\) OR title:\(2000 OR /);
+  assert.doesNotMatch(query, /year:2010 AND/);
+});
+
+test('fetchMovies asks for dated films when sorting by release date, not for other sorts', async () => {
+  const realFetch = globalThis.fetch;
+  const urls = [];
+  globalThis.fetch = async (url) => { urls.push(decodeURIComponent(String(url))); return { ok: true, json: async () => ({ response: { docs: [], numFound: 0 } }) }; };
+  try {
+    await archiveService.fetchMovies({ collection: 'feature_films', sortBy: 'date', sortOrder: 'desc' });
+    await archiveService.fetchMovies({ collection: 'feature_films', sortBy: 'downloads', decade: 1950 });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  assert.match(urls[0], /date:\[1880-01-01 TO \d{4}-12-31\] AND NOT \(\(year:2000/);
+  assert.match(urls[1], /date:\[1950-01-01 TO 1959-12-31\]\) OR title:\(1950 OR/);
+});
+
+test('Full Movies drops an unknown-length upload that is too small to be a feature', async () => {
+  const { runtimeFilter } = await import('./archive.js');
+  const full = runtimeFilter({ minRuntime: 40 });
+  // Real items from Movies & Films, "Top Rated": a film's name, no runtime, a trailer's file size
+  assert.equal(full({ runtimeMinutes: 0, title: 'Do the Right Thing', sizeMB: 52 }), false);
+  assert.equal(full({ runtimeMinutes: 0, title: 'Attack of the Super Monsters', sizeMB: 17 }), false);
+  assert.equal(full({ runtimeMinutes: 0, title: 'Escape From Sobibor', sizeMB: 1469 }), true);
+  assert.equal(full({ runtimeMinutes: 0, title: 'An old low-bitrate transfer', sizeMB: 140 }), true);
+  assert.equal(full({ runtimeMinutes: 0, title: 'Size not reported' }), true, 'no size is not evidence either');
+  assert.equal(runtimeFilter({ minRuntime: 0 })({ runtimeMinutes: 0, title: 'A cartoon', sizeMB: 20 }), true, 'collections with no minimum keep small files');
+  assert.equal(runtimeFilter({ shorts: true })({ runtimeMinutes: 0, title: 'Do the Right Thing', sizeMB: 52 }), true);
+});
+
+test('normalizeMovie reports the upload size in megabytes', () => {
+  assert.equal(archiveService.normalizeMovie({ identifier: 'a', title: 'A', item_size: 52_400_000 }).sizeMB, 52);
+  assert.equal(archiveService.normalizeMovie({ identifier: 'a', title: 'A' }).sizeMB, null);
+});
+
+test('normalizeMovie keeps the uploader\'s tags, split the ways uploaders write them', () => {
+  assert.deepEqual(archiveService.normalizeMovie({ identifier: 'a', title: 'A', subject: ['Horror; zombies', 'kung fu, martial arts'] }).tags, ['Horror', 'zombies', 'kung fu', 'martial arts']);
+  assert.deepEqual(archiveService.normalizeMovie({ identifier: 'a', title: 'A', subject: 'Sci-Fi' }).tags, ['Sci-Fi']);
+  assert.deepEqual(archiveService.normalizeMovie({ identifier: 'a', title: 'A' }).tags, []);
+});
+
+test('suggest finds films by title and tags by subject with a single request', async () => {
+  const realFetch = globalThis.fetch;
+  const urls = [];
+  globalThis.fetch = async (url) => { urls.push(decodeURIComponent(String(url))); return { ok: true, json: async () => ({ response: { numFound: 3, docs: [
+    { identifier: 'z1', title: 'White Zombie', subject: ['zombies', 'horror', 'white zombie'] },
+    { identifier: 'z0', title: 'White Zombie (1932) HD', subject: ['White Zombie'] },
+    { identifier: 'z2', title: 'Night of the Living Dead', subject: 'zombies; horror' },
+    { identifier: 'z3', title: 'Zombies of the Stratosphere', subject: ['serial'] } ] } }) }; };
+  try {
+    const { films, tags } = await archiveService.suggest('zomb');
+    assert.equal(urls.length, 1);
+    assert.match(urls[0], /title:\(zomb\*\) OR subject:\(zomb\*\)/);
+    assert.deepEqual(films.map(f => f.identifier), ['z1', 'z3'], 'only films whose title matches are offered as films, once each');
+    assert.deepEqual(tags.map(t => t.label), ['zombies']);
+    // 'white zombie' as a tag is that film's title, which the film rows already offer
+    assert.ok(!tags.some(t => t.label === 'white zombie'));
+
+    // ...but a theme that is also one upload's title stays: many films carry it
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({ response: { numFound: 6, docs: [
+      { identifier: 'k0', title: 'Kung Fu', subject: ['kung fu'] },
+      ...[1, 2, 3, 4, 5].map(i => ({ identifier: `k${i}`, title: `Shaolin film ${i}`, subject: ['kung fu'] })) ] } }) });
+    assert.deepEqual((await archiveService.suggest('kung')).tags.map(t => t.label), ['kung fu']);
   } finally {
     globalThis.fetch = realFetch;
   }

@@ -1,3 +1,4 @@
+import { matchRanges, suggestTags } from './suggest.js';
 // Archive.org API Service
 
 const ARCHIVE_API = 'https://archive.org/advancedsearch.php';
@@ -39,10 +40,39 @@ export function defaultMinRuntime(collectionId) {
 
 // Predicate for the Full Movies / Shorts toggle. Many Archive.org items have no runtime
 // recorded, which is not evidence of a short, so only a known runtime can exclude a film.
+// A trailer rarely has a runtime either, so among films of unknown length the title decides:
+// "Psycho trailer" is one, "Wheels On Meals (1984) with Trailers" is a film with extras.
+const TRAILER = /\b(trailers?|teasers?|tv spots?)\b/i;
+const MIN_MB_PER_MINUTE = 2.5;
+const FILM_WITH_TRAILERS = /(\b(with|and|plus)|[&+])\s+(\w+\s+)?trailers?\b/i;
+
 export function runtimeFilter({ shorts = false, minRuntime = 0 } = {}) {
-  return (movie) =>
-    movie.runtimeMinutes === 0 ||
-    (shorts ? movie.runtimeMinutes <= 30 : movie.runtimeMinutes >= minRuntime);
+  return (movie) => {
+    if (movie.runtimeMinutes === 0) {
+      if (shorts) return true;
+      // Trailers are often titled like the film itself ("Do the Right Thing", 52 MB). Even a
+      // low-bitrate transfer needs about 2.5 MB a minute, and real features run 400 MB and up.
+      if (movie.sizeMB && movie.sizeMB < minRuntime * MIN_MB_PER_MINUTE) return false;
+      const title = String(movie.title || '');
+      return !TRAILER.test(title) || FILM_WITH_TRAILERS.test(title);
+    }
+    return shorts ? movie.runtimeMinutes <= 30 : movie.runtimeMinutes >= minRuntime;
+  };
+}
+
+// Decades offered as a filter
+export const DECADES = [1910, 1920, 1930, 1940, 1950, 1960, 1970, 1980, 1990, 2000, 2010, 2020];
+
+// Uploaders often leave "date" at the upload date, or the year before it (Drunken Master, 1978,
+// was dated 2026), so such a date says nothing about the film. Nothing was uploaded to
+// Archive.org before 2000, which makes every earlier date trustworthy. Lucene cannot compare two
+// fields, hence one clause per year; this short form is about as long as Archive.org accepts.
+function uploadDates(from, to) {
+  const clauses = [];
+  for (let year = Math.max(from, 2000); year <= Math.min(to, new Date().getFullYear()); year++) {
+    clauses.push(`(year:${year} AND publicdate:[${year}-01-01 TO ${year + 1}-12-31])`);
+  }
+  return clauses.length ? ` AND NOT (${clauses.join(' OR ')})` : '';
 }
 
 // Content filter - block inappropriate content
@@ -164,7 +194,10 @@ class ArchiveService {
       runtimeMinutes,
       runtime: movie.runtime,
       genres: genres.length > 0 ? genres : ['Uncategorized'],
+      // The uploader's own words, as written: one field, a list, or "a; b, c" in a string
+      tags: [].concat(movie.subject || []).flatMap(subject => String(subject).split(/[;,]/)).map(tag => tag.trim()).filter(Boolean),
       downloads: movie.downloads || 0,
+      sizeMB: movie.item_size ? Math.round(movie.item_size / 1e6) : null,
       rating: movie.avg_rating || null,
       description: movie.description,
       creator: Array.isArray(movie.creator) ? movie.creator[0] : movie.creator,
@@ -274,7 +307,9 @@ class ArchiveService {
       collection = 'moviesandfilms',
       minRuntime = null,
       year = null,
-      genre = null
+      genre = null,
+      decade = null, // one of DECADES
+      dated = false  // only films whose release date can be trusted (for sorting by it)
     } = options;
 
     // Just filter by collection - the collection itself defines content type
@@ -308,6 +343,17 @@ class ArchiveService {
       query += ` AND year:${year}`;
     }
 
+    if (DECADES.includes(Number(decade))) {
+      const from = Number(decade);
+      const range = `date:[${from}-01-01 TO ${from + 9}-12-31]${uploadDates(from, from + 9)}`;
+      // A year in the title ("Hellhole (1985)") counts too, except when sorting by date:
+      // those uploads carry an upload date and would sort ahead of everything
+      const years = Array.from({ length: 10 }, (_, i) => from + i).join(' OR ');
+      query += dated ? ` AND ${range}` : ` AND ((${range}) OR title:(${years}))`;
+    } else if (dated) {
+      query += ` AND date:[1880-01-01 TO ${new Date().getFullYear()}-12-31]${uploadDates(2000, 9999)}`;
+    }
+
     // Collections contain sub-collections ("Silent Films", "Vintage Cartoons"), which are
     // folders, not videos. A mediatype:movies filter would be too strict for some collections.
     query += ' AND NOT mediatype:collection';
@@ -321,20 +367,32 @@ class ArchiveService {
     const words = (this.searchWords(text) || []).filter(word => word.length >= 2);
     if (!words.length || words.join('').length < 3) return null;
     const films = VIDEO_CATEGORIES.filter(c => c.films).map(c => c.id).join(' OR ');
-    return `collection:(${films}) AND title:(${words.map(w => `${w}*`).join(' AND ')}) AND NOT mediatype:collection`;
+    const prefixes = `(${words.map(w => `${w}*`).join(' AND ')})`;
+    // Subjects ride along in the same request, so tag suggestions cost Archive.org nothing extra
+    return `collection:(${films}) AND (title:${prefixes} OR subject:${prefixes}) AND NOT mediatype:collection`;
   }
 
-  // A few distinct, most-downloaded films whose titles match what is being typed.
-  // Archive.org takes 1.5-4 s, so callers debounce, pass an AbortSignal, and show local matches first.
-  async suggestTitles(text, { signal, limit = 6 } = {}) {
+  // What to offer while someone types: a few distinct, most-downloaded films whose titles match,
+  // and the tags uploaders use that match. Archive.org takes 1.5-4 s, so callers debounce, pass
+  // an AbortSignal, and show local matches first.
+  async suggest(text, { signal, limit = 6 } = {}) {
     const query = this.buildSuggestQuery(text);
-    if (!query) return [];
-    const { movies } = await this.fetchMovies({ query, rowsPerPage: 30, signal });
+    if (!query) return { films: [], tags: [] };
+    const { movies } = await this.fetchMovies({ query, rowsPerPage: 60, signal });
     const seen = new Set();
-    return movies.filter(movie => {
+    const films = movies.filter(movie => {
+      if (!matchRanges(movie.title, text)) return false; // matched by a tag only
       const key = this.dedupeKey(movie.title);
       return seen.has(key) ? false : seen.add(key);
     }).slice(0, limit);
+    // A film's own title used as a tag ("white zombie", on its re-uploads) is already offered as
+    // a film. A theme that happens to be someone's title ("kung fu") is used far more widely.
+    const titled = new Map();
+    for (const movie of movies) titled.set(this.dedupeKey(movie.title), (titled.get(this.dedupeKey(movie.title)) || 0) + 1);
+    const tags = suggestTags(movies, text, { exclude: STANDARD_GENRES, limit: 8 })
+      .filter(tag => tag.count > 2 * (titled.get(this.dedupeKey(tag.label)) || 0))
+      .slice(0, 4);
+    return { films, tags };
   }
 
   // Fetch movies from Archive.org
@@ -348,12 +406,13 @@ class ArchiveService {
       minRuntime = 0,
       genre = null,
       collection = 'moviesandfilms',
+      decade = null,
       retryDelayMs = 600,
       signal,
       query: queryOverride = null
     } = options;
 
-    const query = queryOverride || this.buildQuery({ searchQuery, genre, collection });
+    const query = queryOverride || this.buildQuery({ searchQuery, genre, collection, decade, dated: sortBy === 'date' });
 
     const fields = [
       'identifier',
@@ -366,7 +425,8 @@ class ArchiveService {
       'creator',
       'avg_rating',
       'date',
-      'publicdate'
+      'publicdate',
+      'item_size'
     ];
 
     const fieldParams = fields.map(f => `fl[]=${f}`).join('&');

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Film,
   Clock,
@@ -10,13 +10,17 @@ import {
   SlidersHorizontal,
   Library,
   ChevronDown,
+  Calendar,
 } from 'lucide-react';
-import archiveService, { STANDARD_GENRES, VIDEO_CATEGORIES, defaultMinRuntime, runtimeFilter } from '../services/archive';
+import archiveService, { STANDARD_GENRES, VIDEO_CATEGORIES, DECADES, defaultMinRuntime, runtimeFilter } from '../services/archive';
 import tmdbService from '../services/tmdb';
+import { postersFirst } from '../services/posterIndex';
+import { parseArchiveUrl } from '../services/archiveUrl';
 import MovieCard from './MovieCard';
 import SearchBox from './SearchBox';
 import SettingsModal from './SettingsModal';
 import MovieDetailPage from './MovieDetailPage';
+import McpBanner from './McpBanner';
 
 const SORT_OPTIONS = {
   downloads: 'Most Popular',
@@ -36,6 +40,7 @@ const URL_FILTER_DEFAULTS = {
   genre: 'all',
   q: '',
   sort: 'downloads',
+  decade: null,
   runtime: 40,
   type: 'features',
 };
@@ -59,6 +64,9 @@ function filtersFromUrl() {
 
   const q = params.get('q');
   if (q) filters.q = q;
+
+  const decade = Number(params.get('decade'));
+  if (DECADES.includes(decade)) filters.decade = decade;
 
   const sort = params.get('sort');
   if (sort && Object.prototype.hasOwnProperty.call(SORT_OPTIONS, sort)) {
@@ -131,6 +139,24 @@ export default function ArchiveMovieBrowser() {
     return () => { cancelled = true; };
   }, []);
 
+  // The film page closes through history.back(), and that popstate also restores the filters
+  // from the URL. So a search made from the film page waits until the close has happened;
+  // applied any earlier, the restore would undo it.
+  const afterClose = useRef(null);
+  const closeFilmThen = (action) => {
+    afterClose.current = action;
+    window.history.back();
+  };
+
+  // A pasted archive.org/details/<identifier> link opens the film here
+  const [linkError, setLinkError] = useState(null);
+  const openFilmLink = (identifier) => {
+    setLinkError(null);
+    archiveService.getMovieByIdentifier(identifier)
+      .then(setSelectedMovie)
+      .catch(() => setLinkError(`Couldn't open that Archive.org link. Check the address: nothing was found at "${identifier}".`));
+  };
+
   // TMDB API key from environment variable only
   const tmdbApiKey = tmdbService.apiKey;
 
@@ -148,6 +174,7 @@ export default function ArchiveMovieBrowser() {
   const [minRuntime, setMinRuntime] = useState(urlFilters.runtime);
   const [contentType, setContentType] = useState(urlFilters.type); // 'features' or 'trailers'
   const [sortBy, setSortBy] = useState(urlFilters.sort);
+  const [decade, setDecade] = useState(urlFilters.decade);
   const [category, setCategory] = useState(urlFilters.collection); // Video collection/category
 
   // Get current category info
@@ -200,13 +227,23 @@ export default function ArchiveMovieBrowser() {
         startPage,
         genre: genreFilter !== 'all' ? genreFilter : null,
         collection: category,
+        decade,
         seenTitles: seen,
         // The server query already applied the genre, so only runtime is checked here
         filter: runtimeFilter({ shorts: contentType === 'trailers', minRuntime })
       });
       if (requestId !== latestRequest.current) return;
 
-      setMovies(prev => (append ? [...prev, ...result.movies] : result.movies));
+      // Ratings arrive one film at a time. Ranking the batch before it is shown means no card
+      // ever moves once it is on screen, and "Load more" adds its films below the ones already there.
+      // Most Popular leads with films that have a real poster; sorts with a visible order
+      // (title, date, rating) are left exactly as Archive.org returned them.
+      const batch = sortBy === 'tmdb_rating' ? await tmdbService.sortByRating(result.movies)
+        : sortBy === 'downloads' ? await postersFirst(result.movies)
+        : result.movies;
+      if (requestId !== latestRequest.current) return;
+
+      setMovies(prev => (append ? [...prev, ...batch] : batch));
       setNextPage(result.nextPage);
     } catch (err) {
       if (requestId !== latestRequest.current) return;
@@ -214,7 +251,7 @@ export default function ArchiveMovieBrowser() {
     } finally {
       if (requestId === latestRequest.current) setLoading(false);
     }
-  }, [activeSearch, sortBy, genreFilter, category, contentType, minRuntime]);
+  }, [activeSearch, sortBy, genreFilter, category, contentType, minRuntime, decade]);
 
   // Fetch from the start whenever filters change
   useEffect(() => {
@@ -223,6 +260,15 @@ export default function ArchiveMovieBrowser() {
 
   // Handle search submit
   const handleSearch = (text = searchQuery) => {
+    // An Archive.org link opens what it points at instead of being searched for as words
+    const link = parseArchiveUrl(text);
+    if (link?.type === 'film') {
+      setSearchQuery('');
+      return openFilmLink(link.identifier);
+    }
+    if (link?.type === 'collection') return handleCategoryChange(link.id);
+    if (link?.type === 'search') text = link.query;
+    setLinkError(null);
     setSearchQuery(text);
     setActiveSearch(text.trim());
     setGenreFilter('all');
@@ -259,6 +305,7 @@ export default function ArchiveMovieBrowser() {
     if (category !== URL_FILTER_DEFAULTS.collection) params.set('collection', category);
     if (genreFilter !== URL_FILTER_DEFAULTS.genre) params.set('genre', genreFilter);
     if (activeSearch) params.set('q', activeSearch);
+    if (decade) params.set('decade', String(decade));
     if (sortBy !== URL_FILTER_DEFAULTS.sort) params.set('sort', sortBy);
     const defaultRuntime = contentType === 'trailers' ? 0 : defaultMinRuntime(category);
     if (minRuntime !== defaultRuntime) params.set('runtime', String(minRuntime));
@@ -281,7 +328,7 @@ export default function ArchiveMovieBrowser() {
     writeFiltersToUrl('push');
     urlSynced.current = true;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [category, genreFilter, activeSearch]);
+  }, [category, genreFilter, activeSearch, decade]);
 
   useEffect(() => {
     writeFiltersToUrl('replace');
@@ -297,6 +344,7 @@ export default function ArchiveMovieBrowser() {
       setActiveSearch(restored.q);
       setSearchQuery(restored.q);
       setSortBy(restored.sort);
+      setDecade(restored.decade);
       setMinRuntime(restored.runtime);
       setContentType(restored.type);
     };
@@ -304,28 +352,65 @@ export default function ArchiveMovieBrowser() {
     return () => window.removeEventListener('popstate', onPopState);
   }, []);
 
-  // Track TMDB ratings for client-side sorting
-  const [tmdbRatings, setTmdbRatings] = useState({});
+  // Genre row scroll: auto-scroll selected pill into view and track end-of-row
+  const genreRowRef = useRef(null);
+  const [genreRowAtEnd, setGenreRowAtEnd] = useState(false);
 
-  // Stable callback for MovieCard
-  const handleTmdbData = useCallback((id, data) => {
-    if (data?.voteAverage) {
-      setTmdbRatings(prev => ({ ...prev, [id]: data.voteAverage }));
+  // Scroll the selected pill to the centre of the row. Only acts when the row
+  // is in scrollable/mobile mode (scrollWidth > clientWidth); on desktop the
+  // pills wrap so there is nothing to scroll.
+  const scrollSelectedPillIntoView = useCallback(() => {
+    const row = genreRowRef.current;
+    if (!row) return;
+    // Skip on desktop: pills wrap so the row is not scrollable
+    if (row.scrollWidth <= row.clientWidth) return;
+    const pressed = row.querySelector('[aria-pressed="true"]');
+    if (pressed) {
+      // Move the row itself: scrollIntoView would also scroll the page when the row is
+      // off screen (rotating the phone deep in the list jumped back to the top)
+      const pill = pressed.getBoundingClientRect();
+      const box = row.getBoundingClientRect();
+      row.scrollLeft += pill.left - box.left - (box.width - pill.width) / 2;
     }
   }, []);
 
-  // Runtime and genre filtering already happened in fetchMovies; films with no
+  // Re-scroll when the selected genre changes (covers initial load from URL
+  // and every manual pill click).
+  useEffect(() => {
+    scrollSelectedPillIntoView();
+  }, [genreFilter, scrollSelectedPillIntoView]);
+
+  // Re-scroll when the row is resized — this covers the desktop→mobile
+  // transition: the row switches from wrapped to scrollable, so the selected
+  // pill may suddenly be off-screen.
+  useEffect(() => {
+    const row = genreRowRef.current;
+    if (!row) return;
+    const observer = new ResizeObserver(scrollSelectedPillIntoView);
+    observer.observe(row);
+    return () => observer.disconnect();
+  }, [scrollSelectedPillIntoView]);
+
+  // Hide the right-edge fade once the row has been scrolled to its end.
+  useEffect(() => {
+    const row = genreRowRef.current;
+    if (!row) return;
+    const update = () => {
+      setGenreRowAtEnd(row.scrollLeft + row.clientWidth >= row.scrollWidth - 1);
+    };
+    row.addEventListener('scroll', update, { passive: true });
+    update(); // run once on mount
+    return () => row.removeEventListener('scroll', update);
+  }, []);
+
+  // Runtime, genre and rating order were all settled in fetchMovies; films with no
   // TMDB poster stay in the list and get a title cover
-  const displayedMovies = useMemo(() => {
-    // Client-side sort by TMDB rating
-    if (sortBy === 'tmdb_rating') {
-      return [...movies].sort((a, b) => (tmdbRatings[b.identifier] || 0) - (tmdbRatings[a.identifier] || 0));
-    }
-    return movies;
-  }, [movies, sortBy, tmdbRatings]);
+  const displayedMovies = movies;
 
   return (
     <div className="min-h-screen bg-gray-900 text-white">
+      <McpBanner />
+
       {/* Header */}
       <header className="sticky top-0 z-40 bg-gray-900/95 backdrop-blur border-b border-gray-800">
         <div className="max-w-7xl mx-auto px-4 py-4">
@@ -419,7 +504,7 @@ export default function ArchiveMovieBrowser() {
               onClick={() => setFiltersOpen(open => !open)}
             >
               <Filter className="w-4 h-4 shrink-0" />
-              <span className="flex-1">Filters: {acrossCollections ? 'All collections' : currentCategory.name} · {contentType === 'trailers' ? 'Shorts, ≤30 min' : `Full Movies, ${minRuntime ? `${minRuntime}+ min` : 'any length'}`} · {SORT_OPTIONS[sortBy]}</span>
+              <span className="flex-1">Filters: {acrossCollections ? 'All collections' : currentCategory.name} · {contentType === 'trailers' ? 'Shorts, ≤30 min' : `Full Movies, ${minRuntime ? `${minRuntime}+ min` : 'any length'}`} · {decade ? `${decade}s · ` : ''}{SORT_OPTIONS[sortBy]}</span>
               <ChevronDown className={`w-4 h-4 shrink-0 transition-transform ${filtersOpen ? 'rotate-180' : ''}`} />
             </button>
 
@@ -502,6 +587,22 @@ export default function ArchiveMovieBrowser() {
                 )}
               </div>
 
+              {/* Decade */}
+              <div className="flex items-center gap-1 sm:gap-2 bg-gray-800 rounded-lg px-2 sm:px-3">
+                <Calendar className="w-4 h-4 text-gray-400 hidden sm:block" />
+                <select
+                  value={decade ?? ''}
+                  aria-label="Decade"
+                  onChange={(e) => setDecade(e.target.value ? Number(e.target.value) : null)}
+                  className="bg-gray-800 text-white py-2 text-xs sm:text-sm focus:outline-none cursor-pointer"
+                >
+                  <option value="">Any decade</option>
+                  {[...DECADES].reverse().map(d => (
+                    <option key={d} value={d}>{d}s</option>
+                  ))}
+                </select>
+              </div>
+
               {/* Sort */}
               <div className="flex items-center gap-1 sm:gap-2 bg-gray-800 rounded-lg px-2 sm:px-3">
                 <SlidersHorizontal className="w-4 h-4 text-gray-400 hidden sm:block" />
@@ -528,7 +629,7 @@ export default function ArchiveMovieBrowser() {
               <Filter className="w-4 h-4 text-gray-400" />
               <span className="text-sm text-gray-400">Filter by genre:</span>
             </div>
-            <div className="flex flex-nowrap md:flex-wrap gap-2 overflow-x-auto md:overflow-visible pb-1 md:pb-0 [mask-image:linear-gradient(to_right,black_94%,transparent)] md:[mask-image:none]">
+            <div ref={genreRowRef} className={`flex flex-nowrap md:flex-wrap gap-2 overflow-x-auto md:overflow-visible pb-1 md:pb-0 md:[mask-image:none] ${genreRowAtEnd ? '' : '[mask-image:linear-gradient(to_right,black_94%,transparent)]'}`}>
               <button
                 onClick={() => handleGenreChange('all')}
                 aria-pressed={genreFilter === 'all'}
@@ -571,6 +672,18 @@ export default function ArchiveMovieBrowser() {
               <span>{minRuntime}+ min runtime</span>
             </>
           )}
+          {decade && (
+            <>
+              <span className="text-gray-600">|</span>
+              <span>{decade}s</span>
+            </>
+          )}
+          {sortBy.startsWith('date') && (
+            <>
+              <span className="text-gray-600">|</span>
+              <span>Films with a known release date. Uploads dated the year they were uploaded are left out: that date is usually not the film's.</span>
+            </>
+          )}
           {tmdbApiKey && (
             <>
               <span className="text-gray-600">|</span>
@@ -578,6 +691,12 @@ export default function ArchiveMovieBrowser() {
             </>
           )}
         </div>
+
+        {linkError && (
+          <div role="alert" className="bg-red-900/30 border border-red-500/50 rounded-lg p-4 mb-6 text-red-300">
+            {linkError}
+          </div>
+        )}
 
         {/* Error state */}
         {error && (
@@ -615,7 +734,6 @@ export default function ArchiveMovieBrowser() {
                 movie={movie}
                 viewMode={viewMode}
                 onPlay={setSelectedMovie}
-                onTmdbData={handleTmdbData}
               />
             ))}
           </div>
@@ -659,6 +777,9 @@ export default function ArchiveMovieBrowser() {
               Internet Archive's {acrossCollections ? 'Moving Image Archive' : `${currentCategory.name} Collection`}
             </a>
           </p>
+          <p className="mt-1">
+            <a href="/mcp.html" className="text-yellow-400 hover:underline">MCP server</a>: search these films from Claude, Cursor and other MCP clients
+          </p>
           {tmdbApiKey && (
             <p className="mt-1">
               Movie posters powered by{' '}
@@ -686,9 +807,18 @@ export default function ArchiveMovieBrowser() {
       {selectedMovie && (
         <MovieDetailPage
           movie={selectedMovie}
-          onClose={() => setSelectedMovie(null)}
+          onClose={() => {
+            setSelectedMovie(null);
+            // A search made from the film page runs once the page has closed (see afterClose)
+            const next = afterClose.current;
+            afterClose.current = null;
+            next?.();
+          }}
           allMovies={displayedMovies}
           onPlayRelated={(movie) => setSelectedMovie(movie)}
+          onSearch={(text) => closeFilmThen(() => handleSearch(text))}
+          onPickGenre={(genre) => closeFilmThen(() => { setSearchQuery(''); setActiveSearch(''); handleGenreChange(genre); })}
+          onPickCollection={(id) => closeFilmThen(() => handleCategoryChange(id))}
         />
       )}
     </div>

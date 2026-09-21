@@ -1,14 +1,16 @@
 import React, { useState, useEffect, useMemo, useId } from 'react';
-import { Search, RefreshCw, Loader2, Film, Filter, Library, Clock } from 'lucide-react';
+import { Search, RefreshCw, Loader2, Film, Filter, Library, Clock, Link2, Tag, Trash2 } from 'lucide-react';
 import archiveService, { STANDARD_GENRES, VIDEO_CATEGORIES } from '../services/archive';
 import { matchRanges, localSuggestions, rememberSearch } from '../services/suggest';
+import { parseArchiveUrl } from '../services/archiveUrl';
 
 const RECENT_KEY = 'recent-searches';
-const ICONS = { search: Search, film: Film, genre: Filter, collection: Library, recent: Clock };
-const HINTS = { genre: 'Genre', collection: 'Collection', recent: 'Recent search' };
+const ICONS = { search: Search, link: Link2, film: Film, genre: Filter, collection: Library, tag: Tag, recent: Clock, clear: Trash2 };
+const HINTS = { genre: 'Genre', collection: 'Collection', tag: 'Tag', recent: 'Recent search' };
 
 // Archive.org answers in 1.5-4 s, so remember what it said for the rest of the visit
 const remoteCache = new Map();
+const NOTHING = { films: [], tags: [] };
 
 function readRecent() {
   try {
@@ -38,7 +40,7 @@ function Highlighted({ text, ranges }) {
 export default function SearchBox({ value, onChange, onSearch, onOpenFilm, onPickGenre, onPickCollection, movies, loading }) {
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(-1);
-  const [remote, setRemote] = useState([]);
+  const [remote, setRemote] = useState(NOTHING);
   const [remoteLoading, setRemoteLoading] = useState(false);
   const [recent, setRecent] = useState(readRecent);
   const listId = useId();
@@ -48,11 +50,11 @@ export default function SearchBox({ value, onChange, onSearch, onOpenFilm, onPic
     [value, movies, recent]
   );
 
-  // Titles from Archive.org: wait for a pause in typing, cancel the previous request
+  // Titles and tags from Archive.org: wait for a pause in typing, cancel the previous request
   useEffect(() => {
     const text = value.trim().toLowerCase();
-    if (!open || !archiveService.buildSuggestQuery(text)) {
-      setRemote([]);
+    if (!open || parseArchiveUrl(text) || !archiveService.buildSuggestQuery(text)) {
+      setRemote(NOTHING);
       setRemoteLoading(false);
       return;
     }
@@ -65,10 +67,10 @@ export default function SearchBox({ value, onChange, onSearch, onOpenFilm, onPic
     const controller = new AbortController();
     setRemoteLoading(true);
     const timer = setTimeout(() => {
-      archiveService.suggestTitles(text, { signal: controller.signal })
-        .then(films => {
-          remoteCache.set(text, films);
-          setRemote(films);
+      archiveService.suggest(text, { signal: controller.signal })
+        .then(found => {
+          remoteCache.set(text, found);
+          setRemote(found);
           setRemoteLoading(false);
         })
         .catch(err => {
@@ -86,12 +88,16 @@ export default function SearchBox({ value, onChange, onSearch, onOpenFilm, onPic
   // what was typed comes before one that only contains it.
   const items = useMemo(() => {
     const text = value.trim();
+    if (parseArchiveUrl(text)) return [{ type: 'link', label: text, ranges: [] }];
     const list = text ? [{ type: 'search', label: text, ranges: [] }] : [];
     list.push(...local.filter(s => s.type !== 'film'));
+    // Tags uploaders use, unless the same words are already offered as a genre or collection
+    const offered = new Set(list.map(item => item.label.toLowerCase()));
+    list.push(...remote.tags.filter(tag => !offered.has(tag.label)).map(tag => ({ type: 'tag', ...tag })));
 
     const films = local.filter(s => s.type === 'film');
     const listed = new Set(films.map(s => archiveService.dedupeKey(s.label)));
-    remote.forEach(movie => {
+    remote.films.forEach(movie => {
       const key = archiveService.dedupeKey(movie.title);
       const ranges = matchRanges(movie.title, text);
       if (ranges && !listed.has(key)) {
@@ -101,16 +107,19 @@ export default function SearchBox({ value, onChange, onSearch, onOpenFilm, onPic
     });
     const startsWithQuery = film => Number(film.ranges[0]?.[0] === 0);
     list.push(...films.sort((a, b) => startsWithQuery(b) - startsWithQuery(a)).slice(0, 8));
+    // Recent searches are kept in this browser only; whenever some are shown, offer to forget them
+    if (list.some(item => item.type === 'recent')) list.push({ type: 'clear', label: 'Clear recent searches', ranges: [] });
     return list;
   }, [value, local, remote]);
 
   useEffect(() => setActive(-1), [value]);
 
   const runSearch = (text) => {
+    setOpen(false);
+    if (parseArchiveUrl(text)) return onSearch(text); // a pasted link is not a search to remember
     const next = rememberSearch(recent, text);
     setRecent(next);
     try { localStorage.setItem(RECENT_KEY, JSON.stringify(next)); } catch { /* private mode */ }
-    setOpen(false);
     onSearch(text);
   };
 
@@ -119,6 +128,12 @@ export default function SearchBox({ value, onChange, onSearch, onOpenFilm, onPic
     if (item.type === 'film') return onOpenFilm(item.movie);
     if (item.type === 'genre') return onPickGenre(item.genre);
     if (item.type === 'collection') return onPickCollection(item.collectionId);
+    if (item.type === 'link') return runSearch(item.label);
+    if (item.type === 'clear') {
+      setRecent([]);
+      try { localStorage.removeItem(RECENT_KEY); } catch { /* private mode */ }
+      return;
+    }
     onChange(item.label); // 'search' and 'recent' both run a full search
     runSearch(item.label);
   };
@@ -135,6 +150,7 @@ export default function SearchBox({ value, onChange, onSearch, onOpenFilm, onPic
       else runSearch(value);
     } else if (e.key === 'Escape' && open) {
       e.stopPropagation(); // close the list, not whatever is behind it
+      e.preventDefault();  // ...including a <dialog>, which closes on Escape's default action
       setOpen(false);
     }
   };
@@ -153,16 +169,16 @@ export default function SearchBox({ value, onChange, onSearch, onOpenFilm, onPic
         aria-controls={listId}
         aria-activedescendant={active >= 0 ? `${listId}-${active}` : undefined}
         autoComplete="off"
-        placeholder="Search movies..."
+        placeholder="Search movies, or paste an Archive.org link"
         value={value}
         onChange={(e) => {
           onChange(e.target.value);
           setOpen(true);
         }}
-        onFocus={() => setOpen(true)}
+        onFocus={() => { setRecent(readRecent()); setOpen(true); }}
         onBlur={() => setOpen(false)}
         onKeyDown={handleKeyDown}
-        className="flex-1 pl-10 pr-4 py-2 bg-gray-800 border border-gray-700 rounded-l-lg focus:outline-none focus:border-yellow-400 min-w-0"
+        className="flex-1 pl-10 pr-4 py-2 bg-gray-800 text-white placeholder-gray-400 border border-gray-700 rounded-l-lg focus:outline-none focus:border-yellow-400 min-w-0"
       />
       <button
         onClick={() => runSearch(value)}
@@ -191,11 +207,13 @@ export default function SearchBox({ value, onChange, onSearch, onOpenFilm, onPic
                 aria-selected={index === active}
                 onMouseEnter={() => setActive(index)}
                 onClick={() => pick(item)}
-                className={`flex items-center gap-3 px-3 py-2.5 cursor-pointer text-sm ${index === active ? 'bg-gray-700' : ''}`}
+                className={`flex items-center gap-3 px-3 py-2.5 cursor-pointer text-sm ${index === active ? 'bg-gray-700' : ''} ${item.type === 'clear' ? 'border-t border-gray-700 mt-1' : ''}`}
               >
                 <Icon className={`w-4 h-4 flex-shrink-0 ${item.type === 'film' ? 'text-yellow-400' : 'text-gray-400'}`} />
-                <span className="flex-1 min-w-0 truncate text-gray-100">
-                  {item.type === 'search' ? <>Search for “{item.label}”</> : <Highlighted text={item.label} ranges={item.ranges} />}
+                <span className={`flex-1 min-w-0 truncate ${item.type === 'clear' ? 'text-gray-400' : 'text-gray-100'}`}>
+                  {item.type === 'search' ? <>Search for “{item.label}”</>
+                    : item.type === 'link' ? <>Open this Archive.org link</>
+                    : <Highlighted text={item.label} ranges={item.ranges} />}
                 </span>
                 <span className="flex-shrink-0 text-xs text-gray-500 tabular-nums">
                   {item.type === 'film' ? item.movie.year : HINTS[item.type]}

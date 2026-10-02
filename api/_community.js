@@ -13,7 +13,9 @@ export const hashKey = async key => hex(new Uint8Array(await crypto.subtle.diges
 
 // Control characters become spaces; invisible and direction-changing characters are dropped
 // eslint-disable-next-line no-control-regex
-export const cleanText = (value, max) => String(value ?? '').replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').replace(/[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, '').replace(/\s+/g, ' ').trim().slice(0, max);
+export const cleanText = (value, max) => String(value ?? '').replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').replace(/[\u200b\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, '').replace(/\s+/g, ' ').trim().slice(0, max);
+// The same for text with paragraphs (a description): line breaks stay, at most one blank line
+export const cleanLines = (value, max) => String(value ?? '').split(/\r\n?|\n/).map(line => cleanText(line, max)).join('\n').replace(/\n{3,}/g, '\n\n').trim().slice(0, max);
 
 export function cleanFilms(list) {
   const seen = new Set();
@@ -108,7 +110,7 @@ export async function createChannel(db, profileId, { name, description, films },
   if (n >= LIMITS.channels) return null;
   const id = newId();
   await db.batch([
-    db.prepare('INSERT INTO channels (id, profile_id, name, description, created, updated) VALUES (?, ?, ?, ?, ?, ?)').bind(id, profileId, cleanText(name, LIMITS.name) || 'Untitled channel', cleanText(description, LIMITS.description), now, now),
+    db.prepare('INSERT INTO channels (id, profile_id, name, description, created, updated) VALUES (?, ?, ?, ?, ?, ?)').bind(id, profileId, cleanText(name, LIMITS.name) || 'Untitled channel', cleanLines(description, LIMITS.description), now, now),
     ...(await filmRows(db, id, cleanFilms(films), flag)),
   ]);
   return id;
@@ -126,16 +128,18 @@ export async function getChannel(db, id) {
 }
 
 export async function updateChannel(db, id, profileId, patch, { now, flag }) {
-  const c = await db.prepare("SELECT status FROM channels WHERE id = ? AND profile_id = ? AND status != 'hidden'").bind(id, profileId).first();
+  const c = await db.prepare("SELECT status, name, description FROM channels WHERE id = ? AND profile_id = ? AND status != 'hidden'").bind(id, profileId).first();
   if (!c) return false;
   const stored = patch.films === undefined ? [] : await storedFilms(db, id);
   const films = patch.films === undefined ? null : cleanFilms(patch.films);
   const notes = new Map(stored.map(r => [r.film_id, r.note]));
   const filmsChanged = films !== null && (films.length !== stored.length || films.some(f => notes.get(f.film) !== f.note));
-  const contentChanged = patch.name !== undefined || patch.description !== undefined || filmsChanged;
+  const name = patch.name === undefined ? null : (cleanText(patch.name, LIMITS.name) || 'Untitled channel');
+  const description = patch.description === undefined ? null : cleanLines(patch.description, LIMITS.description);
+  const contentChanged = (name !== null && name !== c.name) || (description !== null && description !== c.description) || filmsChanged;
   const status = contentChanged ? afterContentEdit(c.status) : c.status;
   const statements = [db.prepare('UPDATE channels SET name = COALESCE(?, name), description = COALESCE(?, description), status = ?, updated = ? WHERE id = ?')
-    .bind(patch.name === undefined ? null : (cleanText(patch.name, LIMITS.name) || 'Untitled channel'), patch.description === undefined ? null : cleanText(patch.description, LIMITS.description), status, now, id)];
+    .bind(name, description, status, now, id)];
   if (films !== null) statements.push(...(await filmRows(db, id, films, flag, stored)));
   await db.batch(statements);
   return true;

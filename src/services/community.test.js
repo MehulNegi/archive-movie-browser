@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { newId, newKey, hashKey, cleanText, cleanFilms, afterContentEdit, submitProblem, isListed, LIMITS, createProfile, authProfile, getProfile, updateProfile, setFavourite, createChannel, getChannel, updateChannel, deleteChannel, submitChannel, setSaved, listChannels } from '../../api/_community.js';
+import { newId, newKey, hashKey, cleanText, cleanLines, cleanFilms, afterContentEdit, submitProblem, isListed, LIMITS, createProfile, authProfile, getProfile, updateProfile, setFavourite, createChannel, getChannel, updateChannel, deleteChannel, submitChannel, setSaved, listChannels } from '../../api/_community.js';
 import { openTestDb } from './testDb.js';
 import { TAKEN_DOWN } from './policy.js';
 
@@ -17,15 +17,27 @@ test('text is trimmed, flattened and cut to its limit', () => {
   assert.equal(cleanText('  a\n\tb\u0000c  ', 80), 'a b c');
   assert.equal(cleanText('x'.repeat(100), 80).length, 80);
   assert.equal(cleanText(null, 80), '');
+  assert.equal(cleanText('\u{1F468}\u200D\u{1F469}\u200D\u{1F467}', 80), '\u{1F468}\u200D\u{1F469}\u200D\u{1F467}');
+  assert.equal(cleanText('\u0645\u06CC\u200C\u062E\u0648\u0627\u0647\u0645', 80), '\u0645\u06CC\u200C\u062E\u0648\u0627\u0647\u0645');
+  assert.equal(cleanText('a\u200Bb\u202Ec', 80), 'abc');
 });
 
 test('text loses C1 controls, zero-width, bidi and byte-order characters', () => {
   assert.equal(cleanText('a\u0085b\u009fc', 80), 'a b c');
-  assert.equal(cleanText('a\u200bb\u200cc\u200dd\u200ee\u200ff', 80), 'abcdef');
+  assert.equal(cleanText('a\u200bb\u200cc\u200dd\u200ee\u200ff', 80), 'ab\u200cc\u200ddef');
   assert.equal(cleanText('\u202aa\u202bb\u202cc\u202dd\u202ee', 80), 'abcde');
   assert.equal(cleanText('\u2066a\u2067b\u2068c\u2069', 80), 'abc');
   assert.equal(cleanText('\ufeffname\ufeff', 80), 'name');
   assert.equal(cleanText('\u200b \u202e ', 80), '');
+});
+
+test('a description keeps its line breaks and nothing else invisible', () => {
+  assert.equal(cleanLines('First line\nsecond\r\nthird', 500), 'First line\nsecond\nthird');
+  assert.equal(cleanLines('a\n\n\n\n\nb', 500), 'a\n\nb');
+  assert.equal(cleanLines('a\n \t \n\n b', 500), 'a\n\nb');
+  assert.equal(cleanLines('\n\n  a\u0000b\u200b\u202ec\tx  \n\n', 500), 'a bc x');
+  assert.equal(cleanLines('x'.repeat(300) + '\n' + 'y'.repeat(300), 500).length, 500);
+  assert.equal(cleanLines(null, 500), '');
 });
 
 test('films: valid ids only, once each, taken-down out, capped, notes cut', () => {
@@ -203,4 +215,24 @@ test('submit re-checks flagged films: cleared ones pass, forbidden ones are drop
   assert.equal(await submitChannel(db, id, pid, { now, flag: async () => true }), 'flagged');
   assert.equal(await submitChannel(db, id, pid, { now, flag: async f => (f === 'film-1' ? 'forbidden' : false) }), null);
   assert.deepEqual((await getChannel(db, id)).films.map(f => f.film), ['film-0', 'film-2', 'film-3', 'film-4', 'film-5']);
+});
+
+test('a name or description equal to the stored one is not a content edit', async () => {
+  const db = await openTestDb();
+  const { id: pid } = await createProfile(db, { now });
+  const id = await createChannel(db, pid, { name: 'Same', description: 'Words', films: films(2) }, { now, flag: noFlag });
+  await db.prepare("UPDATE channels SET status = 'public' WHERE id = ?").bind(id).run();
+  await updateChannel(db, id, pid, { name: '  Same  ', description: ' Words ' }, { now, flag: noFlag });
+  assert.equal((await getChannel(db, id)).status, 'public');
+  await updateChannel(db, id, pid, { name: 'different' }, { now, flag: noFlag });
+  assert.equal((await getChannel(db, id)).status, 'submitted');
+});
+
+test('a channel description is stored with its line breaks, on create and on edit', async () => {
+  const db = await openTestDb();
+  const { id: pid } = await createProfile(db, { now });
+  const id = await createChannel(db, pid, { name: 'Lines', description: 'One\n\n\n\nTwo', films: films(1) }, { now, flag: noFlag });
+  assert.equal((await getChannel(db, id)).description, 'One\n\nTwo');
+  await updateChannel(db, id, pid, { description: 'Three\nFour' }, { now, flag: noFlag });
+  assert.equal((await getChannel(db, id)).description, 'Three\nFour');
 });

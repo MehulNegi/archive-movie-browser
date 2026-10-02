@@ -1,5 +1,5 @@
 // The Cloudflare Worker in front of api/. Static files (the built site in dist/) are served by
-// Cloudflare before this runs; only /api/* and /sitemap.xml reach it (wrangler.jsonc).
+// Cloudflare before this runs; only /api/*, /sitemap.xml, /c/* and /u/* reach it (wrangler.jsonc).
 import archiveList from './api/archive-list.js';
 import sitemap from './api/sitemap.js';
 import subtitles from './api/subtitles.js';
@@ -12,6 +12,8 @@ import { handle as community } from './api/community.js';
 import { redis } from './api/_redis.js';
 import { isForbidden, isMature } from './src/services/policy.js';
 import { route } from './api/_routes.js';
+import { getChannel, getProfile, isListed } from './api/_community.js';
+import posterIndex from './public/poster-index.json' with { type: 'json' };
 
 const months = (now = new Date()) => [0, 1].map(back => new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - back, 1)).toISOString().slice(0, 7));
 async function redisMinutes(members) {
@@ -27,7 +29,7 @@ async function archiveFlag(film) {
 }
 
 // The handlers written for (req, res), run with a web Request and answered with a Response
-const node = (handler) => async (request, query) => {
+const node = (handler) => async (request, query, env) => {
   const req = { method: request.method, query, headers: Object.fromEntries(request.headers) };
   let status = 200, body = null;
   const headers = new Headers();
@@ -38,7 +40,7 @@ const node = (handler) => async (request, query) => {
     send(value) { body = value; },
     end(value) { body = value ?? null; },
   };
-  await handler(req, res);
+  await handler(req, res, env);
   return new Response(body, { status, headers });
 };
 
@@ -56,9 +58,49 @@ const API = {
   community: (request, query, env) => community(request, { db: env.DB, flag: archiveFlag, minutes: redisMinutes, now: Date.now() }),
 };
 
+// The share card's picture: the poster of the first film that has one
+const posterOf = (films) => {
+  for (const film of films) {
+    const entry = posterIndex.films[film];
+    if (entry?.p && !isForbidden({ title: entry.t })) return `https://image.tmdb.org/t/p/w500${entry.p}`;
+  }
+  return null;
+};
+
+const escapeHtml = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+// /c/<id> and /u/<id>: the app's page with a share preview; unlisted channels and profiles are noindex
+async function sharePage(request, env, kind, id) {
+  const asset = await env.ASSETS.fetch(new Request(new URL('/', request.url)));
+  const headers = new Headers(asset.headers);
+  headers.delete('ETag');
+  headers.set('Cache-Control', 'no-store');
+  headers.set('X-Robots-Tag', 'noindex');
+  let html = await asset.text();
+  let data;
+  try {
+    data = kind === 'c' ? await getChannel(env.DB, id) : await getProfile(env.DB, id);
+  } catch {
+    return new Response(html, { status: asset.status, headers });
+  }
+  const listed = kind === 'c' && !!data && isListed(data.status);
+  const title = data ? `${data.name || 'A profile'} | Orphaned Films` : 'Orphaned Films';
+  const description = data && kind === 'c' ? `${data.films.length} ${data.films.length === 1 ? 'film' : 'films'}${data.owner ? ` · by ${data.owner}` : ''}` : 'Forgotten films, found.';
+  const image = data && posterOf(kind === 'c' ? data.films.map(f => f.film) : data.favourites);
+  const meta = `<meta property="og:title" content="${escapeHtml(title)}"><meta name="description" content="${escapeHtml(description)}"><meta property="og:description" content="${escapeHtml(description)}">${image ? `<meta property="og:image" content="${escapeHtml(image)}">` : ''}<meta name="twitter:card" content="${image ? 'summary_large_image' : 'summary'}">${listed ? '' : '<meta name="robots" content="noindex">'}`;
+  html = html.replace(/<meta (?:name="description"|property="og:(?:title|description|image[^"]*)"|name="twitter:card")[^>]*>\s*/g, '');
+  if (data) html = html.replace(/<title>[^<]*<\/title>/, () => `<title>${escapeHtml(title)}</title>`);
+  html = html.replace('</head>', () => `${meta}</head>`);
+  if (listed) headers.delete('X-Robots-Tag');
+  return new Response(html, { status: data ? 200 : 404, headers });
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    const share = ['GET', 'HEAD'].includes(request.method) && url.pathname.match(/^\/(c|u)\/([a-z2-7]{10})\/?$/);
+    if (share) return sharePage(request, env, share[1], share[2]);
+    if (/^\/[cu]\//.test(url.pathname)) return env.ASSETS.fetch(request);
     const found = route(url.pathname);
     if (!found) return new Response('Not found', { status: 404 });
     const query = { ...Object.fromEntries(url.searchParams), ...found.query };

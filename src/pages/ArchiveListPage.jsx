@@ -8,6 +8,8 @@ import { readMyChannel, toggleSaved, hasFilm, shareUrl } from '../services/myCha
 import { track } from '../services/analytics';
 import { CardGrid } from '../ui/Section';
 import FilmCard from '../ui/FilmCard';
+import FavouriteButton from '../components/FavouriteButton';
+import AddToChannel from '../components/AddToChannel';
 import Button from '../ui/Button';
 import SiteHeader from '../layout/SiteHeader';
 import SiteFooter from '../layout/SiteFooter';
@@ -44,8 +46,10 @@ async function describe(identifiers) {
   return withPosters(items);
 }
 
-// Film cards that can each go on your own channel, which stays in this browser
-export function FilmGrid({ films, track: from }) {
+// Film cards that can each go on your own channel, which stays in this browser.
+// notes: an optional line of text under each card, by film id. saves: ♡ and + in place of the
+// browser-only channel toggle
+export function FilmGrid({ films, track: from, notes, saves = false }) {
   const [mine, setMine] = useState(readMyChannel);
   const toggle = (filmId) => { setMine(toggleSaved(filmId)); track('TV', { action: hasFilm(mine, filmId) ? 'remove from my channel' : 'add to my channel', film: filmId }); };
   return (
@@ -53,9 +57,14 @@ export function FilmGrid({ films, track: from }) {
       {films.map(film => (
         <div key={film.id} className="flex flex-col gap-2">
           <FilmCard film={film} href={watchUrl(film.id)} track={from} />
-          <button type="button" onClick={() => toggle(film.id)} aria-pressed={hasFilm(mine, film.id)} className="nav-link text-left hover:text-signal">
-            {hasFilm(mine, film.id) ? 'On my channel' : 'Add to my channel'}
-          </button>
+          {notes?.[film.id] && <p className="text-sm text-muted break-words">{notes[film.id]}</p>}
+          {saves
+            ? <div className="flex items-center gap-1"><FavouriteButton film={film.id} /><AddToChannel film={film.id} /></div>
+            : (
+              <button type="button" onClick={() => toggle(film.id)} aria-pressed={hasFilm(mine, film.id)} className="nav-link text-left hover:text-signal">
+                {hasFilm(mine, film.id) ? 'On my channel' : 'Add to my channel'}
+              </button>
+            )}
         </div>
       ))}
     </CardGrid>

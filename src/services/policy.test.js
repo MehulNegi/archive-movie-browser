@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
-import { isTakenDown, isRecent, TAKEN_DOWN } from './policy.js';
+import { isTakenDown, isRecent, TAKEN_DOWN, isMature } from './policy.js';
 
 const FIXTURE = 'orphanedfilms-takedown-test';
 const entry = (y) => ({ i: 999, t: 'Test film', y, p: '/p.jpg', c: 1, g: ['Horror'], v: 7, k: 900, l: 90, d: 90 });
@@ -130,4 +130,26 @@ test('a listed film stays off a shared channel too, even when Archive.org would 
   t.mock.method(globalThis, 'fetch', async () => new Response(JSON.stringify({ metadata: { title: 'x' }, files: [{ name: 'a.mp4', format: 'h.264', length: '5000', size: '900000000' }] })));
   const { personalChannel } = await import('../../api/_tv.js');
   assert.equal((await personalChannel([id])).lineup.length, 0);
+});
+
+test('mature: sexual words in the title or tags, or plainly in the description', () => {
+  assert.equal(isMature({ title: 'Softcore Classics Vol 2' }), true);
+  assert.equal(isMature({ title: 'A drama', subject: ['erotic'] }), true);
+  assert.equal(isMature({ title: 'A drama', description: 'contains nudity' }), true);
+  assert.equal(isMature({ title: 'Adult education film', description: 'for adult learners' }), true);
+  assert.equal(isMature({ title: 'Long Road West', description: 'an adult man drives west' }), false);
+  assert.equal(isMature({ title: 'Night Visitor' }), false);
+  // False positives excluded: strip, explicit, naked in non-sexual contexts
+  assert.equal(isMature({ title: 'Blue Stripes' }), false);
+  assert.equal(isMature({ title: 'Harbor Strip' }), false);
+  assert.equal(isMature({ title: 'The Naked Town' }), false);
+  assert.equal(isMature({ title: 'A film', subject: ['Comic strips'] }), false);
+  assert.equal(isMature({ title: 'A film', description: 'a comic strip artist' }), false);
+  assert.equal(isMature({ title: 'A film', description: 'a man in a striped suit' }), false);
+  assert.equal(isMature({ title: 'A film', description: 'he is stripped of his rank' }), false);
+  assert.equal(isMature({ title: 'A film', description: 'explicit orders from the captain' }), false);
+  assert.equal(isMature({ title: 'A film', description: 'the naked eye' }), false);
+  // True positives for striptease and strip clubs
+  assert.equal(isMature({ title: 'Striptease Revue' }), true);
+  assert.equal(isMature({ title: 'A film', description: 'a strip club dancer' }), true);
 });

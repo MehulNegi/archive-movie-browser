@@ -1,5 +1,5 @@
 // /api/profile, /api/channel, /api/channels
-import { createProfile, authProfile, getProfile, updateProfile, setFavourite, createChannel, getChannel, updateChannel, deleteChannel, submitChannel, setSaved, listChannels } from './_community.js';
+import { createProfile, authProfile, getProfile, updateProfile, setFavourite, createChannel, getChannel, updateChannel, deleteChannel, submitChannel, setSaved, listChannels, hashKey, isListed } from './_community.js';
 
 const MAX_BODY = 20_000;
 const json = (body, status = 200, headers = {}) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json', 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-store', ...headers } });
@@ -14,13 +14,43 @@ function sameSite(request) {
   return !origin || originHost(origin) === new URL(request.url).host;
 }
 
-// Fixed-window counter in the limits table
+// The address is never stored: limits are keyed by a hash of it that changes every UTC day
+// (salted with LIMIT_SALT when the Worker has one), cut to 16 hex characters
+const salt = () => (typeof process !== 'undefined' && process.env?.LIMIT_SALT) || '';
+export const addressKey = async (ip, now) => (await hashKey(`${new Date(now).toISOString().slice(0, 10)}|${salt()}|${ip}`)).slice(0, 16);
+
+// Fixed-window counter in the limits table. Every write here also drops expired rows, in the
+// same round trip: the table only ever holds the last hour's rows, so the sweep is small, and no
+// row outlives its window by more than the next write from anyone.
 async function overLimit(db, bucket, max, windowMs, now) {
   const row = await db.prepare('SELECT count, until FROM limits WHERE bucket = ?').bind(bucket).first();
-  if (!row || row.until <= now) { await db.prepare('INSERT OR REPLACE INTO limits (bucket, count, until) VALUES (?, 1, ?)').bind(bucket, now + windowMs).run(); return false; }
-  if (row.count >= max) return true;
-  await db.prepare('UPDATE limits SET count = count + 1 WHERE bucket = ?').bind(bucket).run();
+  if (row && row.until > now && row.count >= max) return true;
+  await db.batch([
+    db.prepare('DELETE FROM limits WHERE until <= ?').bind(now),
+    row && row.until > now
+      ? db.prepare('UPDATE limits SET count = count + 1 WHERE bucket = ?').bind(bucket)
+      : db.prepare('INSERT OR REPLACE INTO limits (bucket, count, until) VALUES (?, 1, ?)').bind(bucket, now + windowMs),
+  ]);
   return false;
+}
+
+// New films looked up on Archive.org per address per hour; past it a new film is stored
+// flagged without a lookup, and a submit re-checks it once the hour is over
+export const LOOKUPS = 200;
+async function withLookups(db, bucket, flag, now, run) {
+  const row = await db.prepare('SELECT count, until FROM limits WHERE bucket = ?').bind(bucket).first();
+  const live = row && row.until > now;
+  let used = 0;
+  const left = LOOKUPS - (live ? row.count : 0);
+  try {
+    return await run(film => (used < left ? (used++, flag(film)) : true));
+  } finally {
+    if (used) {
+      await (live
+        ? db.prepare('UPDATE limits SET count = count + ? WHERE bucket = ?').bind(used, bucket)
+        : db.prepare('INSERT OR REPLACE INTO limits (bucket, count, until) VALUES (?, ?, ?)').bind(bucket, used, now + 3_600_000)).run();
+    }
+  }
 }
 
 async function readBody(request) {
@@ -43,7 +73,6 @@ async function route(request, { db, flag, minutes, now }) {
   const url = new URL(request.url);
   const parts = url.pathname.replace(/\/+$/, '').split('/').slice(2); // ['profile', id, ...]
   const method = request.method;
-  const ip = request.headers.get('cf-connecting-ip') || 'unknown';
 
   if (parts[0] === 'channels' && parts.length === 1) {
     if (method !== 'GET') return empty(405);
@@ -61,17 +90,17 @@ async function route(request, { db, flag, minutes, now }) {
       const { profileId, ...open } = c;
       // The owner's own id comes back only to the owner, so the page can show the editor
       if (request.headers.get('authorization') && (await owner(request, db))?.id === profileId) open.ownerId = profileId;
-      return json(open, 200, c.status === 'public' || c.status === 'featured' ? {} : { 'X-Robots-Tag': 'noindex' });
+      return json(open, 200, isListed(c.status) && !c.films.some(f => f.flagged) ? {} : { 'X-Robots-Tag': 'noindex' });
     }
     return empty(404);
   }
 
   if (!sameSite(request)) return empty(403);
-  if (await overLimit(db, `w:${ip}`, 120, 60_000, now)) return empty(429);
+  const address = await addressKey(request.headers.get('cf-connecting-ip') || 'unknown', now);
+  if (await overLimit(db, `w:${address}`, 120, 60_000, now)) return empty(429);
 
   if (method === 'POST' && parts[0] === 'profile' && parts.length === 1) {
-    await db.prepare('DELETE FROM limits WHERE until < ?').bind(now).run();
-    if (await overLimit(db, `p:${ip}`, 5, 3_600_000, now)) return empty(429);
+    if (await overLimit(db, `p:${address}`, 5, 3_600_000, now)) return empty(429);
     return json(await createProfile(db, { now }), 201);
   }
 
@@ -93,15 +122,16 @@ async function route(request, { db, flag, minutes, now }) {
   if (parts[0] === 'profile') return empty(404);
 
   if (parts[0] === 'channel') {
+    const looked = run => withLookups(db, `l:${address}`, flag, now, run);
     if (method === 'POST' && parts.length === 1) {
-      const id = await createChannel(db, me.id, body, { now, flag });
+      const id = await looked(f => createChannel(db, me.id, body, { now, flag: f }));
       return id ? json({ id }, 201) : empty(409);
     }
     const id = parts[1];
-    if (parts.length === 2 && method === 'PATCH') return empty(await updateChannel(db, id, me.id, body, { now, flag }) ? 204 : 404);
+    if (parts.length === 2 && method === 'PATCH') return empty(await looked(f => updateChannel(db, id, me.id, body, { now, flag: f })) ? 204 : 404);
     if (parts.length === 2 && method === 'DELETE') return empty(await deleteChannel(db, id, me.id) ? 204 : 404);
     if (parts[2] === 'submit' && method === 'POST') {
-      const problem = await submitChannel(db, id, me.id, { now, flag });
+      const problem = await looked(f => submitChannel(db, id, me.id, { now, flag: f }));
       return problem ? json({ problem }, 409) : empty(204);
     }
     if (parts[2] === 'save' && (method === 'PUT' || method === 'DELETE')) return empty(await setSaved(db, me.id, id, method === 'PUT', { now }) ? 204 : 404);

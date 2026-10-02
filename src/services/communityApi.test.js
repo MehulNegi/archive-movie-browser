@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { openTestDb } from './testDb.js';
-import { handle } from '../../api/community.js';
+import { handle, addressKey, LOOKUPS } from '../../api/community.js';
 
 const ORIGIN = 'https://www.orphanedfilms.com';
 const ctx = async () => ({ db: await openTestDb(), flag: async () => false, minutes: async () => ({}), now: 1_700_000_000_000 });
@@ -79,11 +79,34 @@ test('a declared oversized body is refused before reading', async () => {
   assert.equal(res.status, 413);
 });
 
-test('creating a profile clears expired limit rows', async () => {
+test('any write clears expired limit rows', async () => {
   const c = await ctx();
+  const me = await (await call(c, 'POST', '/api/profile')).json();
   await c.db.prepare("INSERT INTO limits (bucket, count, until) VALUES ('old', 1, 5)").run();
-  await call(c, 'POST', '/api/profile');
+  await call(c, 'PUT', `/api/profile/${me.id}/favourites/Detour`, { auth: me });
   assert.equal(await c.db.prepare("SELECT 1 AS n FROM limits WHERE bucket = 'old'").first(), null);
+});
+
+test('limit rows never hold the address, and still limit', async () => {
+  const c = await ctx();
+  const me = await (await call(c, 'POST', '/api/profile', { ip: '203.0.113.7' })).json();
+  assert.equal((await call(c, 'PUT', `/api/profile/${me.id}/favourites/Detour`, { auth: me, ip: '203.0.113.7' })).status, 204);
+  const buckets = (await c.db.prepare('SELECT bucket FROM limits').all()).results.map(r => r.bucket);
+  assert.deepEqual(buckets.map(b => b[0]).sort(), ['p', 'w']);
+  for (const b of buckets) {
+    assert.match(b, /^[pw]:[0-9a-f]{16}$/);
+    assert.ok(!b.includes('203.0.113.7'));
+  }
+  for (let i = 0; i < 4; i++) await call(c, 'POST', '/api/profile', { ip: '203.0.113.7' });
+  assert.equal((await call(c, 'POST', '/api/profile', { ip: '203.0.113.7' })).status, 429);
+  assert.equal((await call(c, 'POST', '/api/profile', { ip: '203.0.113.8' })).status, 201, 'another address has its own count');
+});
+
+test('the address key changes with the day', async () => {
+  const day = 86_400_000;
+  assert.equal(await addressKey('203.0.113.7', 0), await addressKey('203.0.113.7', day - 1));
+  assert.notEqual(await addressKey('203.0.113.7', 0), await addressKey('203.0.113.7', day));
+  assert.notEqual(await addressKey('203.0.113.7', 0), await addressKey('203.0.113.8', 0));
 });
 
 test('an internal failure is a plain 500', async () => {
@@ -103,4 +126,51 @@ test('a channel read says who owns it only to the owner', async () => {
   assert.equal((await (await call(c, 'GET', `/api/channel/${id}`)).json()).ownerId, undefined);
   assert.equal((await (await call(c, 'GET', `/api/channel/${id}`, { auth: other })).json()).ownerId, undefined);
   assert.equal((await (await call(c, 'GET', `/api/channel/${id}`, { auth: { id: me.id, key: 'f'.repeat(64) } })).json()).ownerId, undefined);
+});
+
+test('a film the filter refuses is a 400 as a favourite', async () => {
+  const c = await ctx();
+  const me = await (await call(c, 'POST', '/api/profile')).json();
+  assert.equal((await call(c, 'PUT', `/api/profile/${me.id}/favourites/test_snuff-film.upload`, { auth: me })).status, 400);
+});
+
+test('a listed channel holding a flagged film is noindex', async () => {
+  const c = await ctx();
+  const me = await (await call(c, 'POST', '/api/profile')).json();
+  const { id } = await (await call(c, 'POST', '/api/channel', { auth: me, body: { name: 'N', films: [{ film: 'a' }] } })).json();
+  await c.db.prepare("UPDATE channels SET status = 'public' WHERE id = ?").bind(id).run();
+  assert.equal((await call(c, 'GET', `/api/channel/${id}`)).headers.get('x-robots-tag'), null);
+  await c.db.prepare('UPDATE channel_films SET flagged = 1 WHERE channel_id = ?').bind(id).run();
+  assert.equal((await call(c, 'GET', `/api/channel/${id}`)).headers.get('x-robots-tag'), 'noindex');
+});
+
+test('Archive.org lookups from one address are capped per hour; past it new films are stored flagged', async () => {
+  const c = await ctx();
+  let asked = 0;
+  c.flag = async () => { asked++; return false; };
+  const me = await (await call(c, 'POST', '/api/profile')).json();
+  await c.db.prepare('INSERT INTO limits (bucket, count, until) VALUES (?, ?, ?)').bind(`l:${await addressKey('1.1.1.1', c.now)}`, LOOKUPS - 2, c.now + 1000).run();
+  const films = Array.from({ length: 5 }, (_, i) => ({ film: `f-${i}` }));
+  const { id } = await (await call(c, 'POST', '/api/channel', { auth: me, body: { name: 'N', films } })).json();
+  assert.equal(asked, 2);
+  assert.deepEqual((await (await call(c, 'GET', `/api/channel/${id}`)).json()).films.map(f => f.flagged), [false, false, true, true, true]);
+  await c.db.prepare("UPDATE profiles SET agreed_at = 1 WHERE id = ?").bind(me.id).run();
+  assert.equal((await (await call(c, 'POST', `/api/channel/${id}/submit`, { auth: me })).json()).problem, 'flagged');
+  assert.equal(asked, 2, 'no lookup past the cap, on submit either');
+  const other = await (await call(c, 'POST', '/api/profile', { ip: '2.2.2.2' })).json();
+  await call(c, 'POST', '/api/channel', { auth: other, ip: '2.2.2.2', body: { name: 'M', films } });
+  assert.equal(asked, 7, 'another address has its own budget');
+});
+
+test('submit does not look anything up for a hidden channel', async () => {
+  const c = await ctx();
+  let asked = 0;
+  c.flag = async () => { asked++; return true; };
+  const me = await (await call(c, 'POST', '/api/profile')).json();
+  const { id } = await (await call(c, 'POST', '/api/channel', { auth: me, body: { name: 'N', films: [{ film: 'a' }] } })).json();
+  await c.db.prepare("UPDATE profiles SET agreed_at = 1 WHERE id = ?").bind(me.id).run();
+  await c.db.prepare("UPDATE channels SET status = 'hidden' WHERE id = ?").bind(id).run();
+  asked = 0;
+  assert.equal((await (await call(c, 'POST', `/api/channel/${id}/submit`, { auth: me })).json()).problem, 'hidden');
+  assert.equal(asked, 0);
 });

@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { tvPersonal, personalNumber, pinTo, followCopy, MAX_ON_TV } from './yourChannels.js';
+import { tvPersonal, personalNumber, pinTo, followCopy, awaitingSaved, toFetch, airable, MAX_ON_TV } from './yourChannels.js';
 
-const ch = (id, films, created = 0) => ({ id, name: `Channel ${id}`, status: 'private', films, created });
+const ch = (id, films) => ({ id, name: `Channel ${id}`, status: 'private', films });
 
 test('no profile: the old browser list, nothing from the server', () => {
   assert.deepEqual(tvPersonal({ profileId: null, carriedId: null, channels: [ch('a', 3)] }), { legacy: true, saved: [] });
@@ -17,15 +17,16 @@ test('once copied, the old list goes and the saved channels show, empty ones lef
   const r = tvPersonal({ profileId: 'p1', carriedId: 'p1', channels: [ch('a', 2), ch('b', 0), ch('c', 5)] });
   assert.equal(r.legacy, false);
   assert.deepEqual(r.saved.map(c => c.id), ['a', 'c']);
+  assert.deepEqual(r.saved[0], { id: 'a', name: 'Channel a', films: 2 });
 });
 
-test('oldest first, whatever order they arrive in, so an edit never renumbers them', () => {
-  const r = tvPersonal({ profileId: 'p1', carriedId: 'p1', channels: [ch('newest', 1, 300), ch('first', 2, 100), ch('middle', 1, 200)] });
+test('in the order the server sends them (oldest first)', () => {
+  const r = tvPersonal({ profileId: 'p1', carriedId: 'p1', channels: [ch('first', 2), ch('middle', 1), ch('newest', 1)] });
   assert.deepEqual(r.saved.map(c => c.id), ['first', 'middle', 'newest']);
 });
 
-test('at most ten, the oldest ten', () => {
-  const channels = Array.from({ length: 14 }, (_, i) => ch(`c${i}`, 1, i)).reverse();
+test('at most ten, the first ten', () => {
+  const channels = Array.from({ length: 14 }, (_, i) => ch(`c${i}`, 1));
   const r = tvPersonal({ profileId: 'p1', carriedId: 'p1', channels });
   assert.equal(r.saved.length, MAX_ON_TV);
   assert.deepEqual(r.saved.map(c => c.id), Array.from({ length: 10 }, (_, i) => `c${i}`));
@@ -39,13 +40,19 @@ test('personal channels are numbered 0, 0b, 0c ...', () => {
   assert.deepEqual([0, 1, 2, 9].map(personalNumber), ['0', '0b', '0c', '0j']);
 });
 
-test('the set holds the channel it fell back to, but never replaces mine', () => {
+test('the set holds the channel it fell back to', () => {
   const station = { id: 'kung-fu-theater' };
   assert.equal(pinTo('gone', station), 'kung-fu-theater');
   assert.equal(pinTo(null, station), 'kung-fu-theater');
   assert.equal(pinTo('kung-fu-theater', station), null);
-  assert.equal(pinTo('mine', station), null, 'an empty /tv#mine keeps its panel');
   assert.equal(pinTo('gone', null), null);
+});
+
+test('mine is left as asked only while the old list can show', () => {
+  const station = { id: 'kung-fu-theater' };
+  assert.equal(pinTo('mine', station, true), null, 'an empty /tv#mine keeps its panel');
+  assert.equal(pinTo('mine', station, false), 'kung-fu-theater', 'otherwise held like any other');
+  assert.equal(pinTo('mine', { id: 'c-abc' }, false), 'c-abc');
 });
 
 test('watching the old list as it is copied: the old list stays until the copy is on the set', () => {
@@ -60,4 +67,36 @@ test('nothing to follow: not on mine, still the old list, or the copy is not kno
   assert.deepEqual(followCopy({ currentId: 'mine', legacy: true, copied: 'abc', onSet: [] }), { id: 'mine', keepOld: false });
   assert.deepEqual(followCopy({ currentId: 'mine', legacy: false, copied: null, onSet: [] }), { id: 'mine', keepOld: false });
   assert.deepEqual(followCopy({ currentId: 'mine', legacy: false, copied: 'abc', onSet: [], left: ['abc'] }), { id: 'mine', keepOld: false }, 'a copy that will not air');
+});
+
+test('a copy the loaded profile does not have (deleted, or another profile\'s) does not bring the old list back', () => {
+  const asked = { currentId: 'mine', legacy: false, copied: 'abc', onSet: ['c-other'] };
+  assert.deepEqual(followCopy({ ...asked, known: ['other'] }), { id: 'mine', keepOld: false });
+  assert.deepEqual(followCopy({ ...asked, known: [] }), { id: 'mine', keepOld: false });
+  assert.deepEqual(followCopy({ ...asked, known: ['other', 'abc'] }), { id: 'mine', keepOld: true }, 'known, still loading');
+  assert.deepEqual(followCopy({ ...asked, known: null }), { id: 'mine', keepOld: true }, 'profile not loaded yet');
+});
+
+test('the set waits for the profile, then its channels, and stops once a load ends with nothing', () => {
+  const me = { channels: [] };
+  assert.equal(awaitingSaved({ profileId: null, me: null, tried: false, pending: false }), false, 'no profile');
+  assert.equal(awaitingSaved({ profileId: 'p1', me: null, tried: false, pending: false }), true, 'loading');
+  assert.equal(awaitingSaved({ profileId: 'p1', me: null, tried: true, pending: false }), false, 'failed');
+  assert.equal(awaitingSaved({ profileId: 'p1', me, tried: true, pending: true }), true, 'channels loading');
+  assert.equal(awaitingSaved({ profileId: 'p1', me, tried: true, pending: false }), false);
+});
+
+test('only new channels, and ones whose films changed, are loaded again', () => {
+  const list = [{ id: 'a', films: 2 }, { id: 'b', films: 4 }, { id: 'c', films: 1 }];
+  assert.deepEqual(toFetch(list, {}).map(c => c.id), ['a', 'b', 'c']);
+  assert.deepEqual(toFetch(list, { a: 2, b: 3, c: 1 }).map(c => c.id), ['b'], 'a film was added to b');
+  assert.deepEqual(toFetch(list, { a: 2, b: 4 }).map(c => c.id), ['c']);
+  assert.deepEqual(toFetch(list, { a: 2, b: 4, c: 1 }), []);
+});
+
+test('a saved channel that failed or has nothing on leaves a gap; the rest keep their numbers', () => {
+  const list = [{ id: 'a' }, { id: 'b' }, { id: 'c' }, { id: 'd' }];
+  const loaded = { a: [1], b: [], d: [1] };
+  assert.deepEqual(airable(list, loaded).map(c => [c.id, c.number]), [['a', '0'], ['d', '0d']]);
+  assert.deepEqual(airable(list, {}), []);
 });

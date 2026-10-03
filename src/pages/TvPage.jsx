@@ -21,7 +21,7 @@ import AddToChannel from '../components/AddToChannel';
 import useProfile from '../hooks/useProfile';
 import useSavedChannels from '../hooks/useSavedChannels';
 import { carriedInto, carriedChannel } from '../services/profile';
-import { tvPersonal, personalNumber, pinTo, followCopy } from '../services/yourChannels';
+import { tvPersonal, personalNumber, pinTo, followCopy, awaitingSaved } from '../services/yourChannels';
 
 // Television. Every channel is a list playing in order from a fixed moment, so what is on is
 // the same for everyone. The page keeps its own clock: /api/tv gives the lineups once, and the
@@ -219,15 +219,15 @@ export default function TvPage({ channel = null, children }) {
   const { channels: stations, error } = useSchedule();
   // A profile's own channels (not on a channel page). The old browser-only list shows only
   // until it has been copied to the profile.
-  const { data: me, profile } = useProfile();
+  const { data: me, tried, profile } = useProfile();
   const profileId = channel ? null : profile?.id;
   const personal = useMemo(() => (channel ? { legacy: true, saved: [] } : tvPersonal({ profileId, carriedId: carriedInto(), channels: me?.channels })), [channel, profileId, me]);
   const saved = useSavedChannels(personal.saved);
-  const savedPending = !!profileId && (!me || saved.pending);
+  const savedPending = awaitingSaved({ profileId, me, tried, pending: saved.pending });
   // The channel in the link, else the one this browser watched last, else channel 1
   const [currentId, setCurrentId] = useState(() => { if (channel) return channel.id; try { return decodeURIComponent(window.location.hash.slice(1)) || readLast(); } catch { return readLast(); } });
   const follow = followCopy({ currentId, legacy: personal.legacy, copied: carriedChannel(), onSet: saved.channels.map(c => c.id),
-    left: (me?.channels || []).map(c => c.id).filter(id => !personal.saved.some(c => c.id === id)) });
+    left: (me?.channels || []).map(c => c.id).filter(id => !personal.saved.some(c => c.id === id)), known: me && (me.channels || []).map(c => c.id) });
   const mine = useMyChannel(6, channel, !personal.legacy && !follow.keepOld);
   const span = useGuideSpan();
   const [open, setOpen] = useState(null); // the guide row playing under itself
@@ -236,9 +236,9 @@ export default function TvPage({ channel = null, children }) {
   const waiting = !!channel && !!mine?.pending;
   const empty = !!channel && !waiting && !mine?.lineup.length;
   const channels = useMemo(() => {
-    const own = [...saved.channels, ...(mine && mine.lineup.length && !waiting ? [mine] : [])];
-    return [...(channel ? own : own.map((c, i) => ({ ...c, number: personalNumber(i) }))), ...stations];
-  }, [saved.channels, mine, stations, waiting, channel]);
+    const own = mine && mine.lineup.length && !waiting ? [channel ? mine : { ...mine, number: personalNumber(personal.saved.length) }] : [];
+    return [...saved.channels, ...own, ...stations];
+  }, [saved.channels, personal.saved.length, mine, stations, waiting, channel]);
   const [now, setNow] = useState(Date.now);
   useEffect(() => { const t = setInterval(() => setNow(Date.now()), 30_000); return () => clearInterval(t); }, []);
   useEffect(() => { if (!channel) document.title = 'TV | Orphaned Films'; }, [channel]);
@@ -256,9 +256,9 @@ export default function TvPage({ channel = null, children }) {
     : channels.find(c => c.id === follow.id) || (mine?.lineup.length && window.location.search.includes('mine=') ? channels.find(c => c.id === mine.id) : null) || channels[0] || null), [channels, currentId, follow.id, mine, waiting, empty, channel, holding]);
   // Once the set has picked a channel it stays on it, even when an add reorders your channels
   useEffect(() => {
-    const pin = pinTo(currentId, current);
+    const pin = pinTo(currentId, current, personal.legacy || follow.keepOld);
     if (!channel && settled && stations.length && pin) setCurrentId(pin);
-  }, [channel, settled, stations.length, current, currentId]);
+  }, [channel, settled, stations.length, current, currentId, personal.legacy, follow.keepOld]);
   const tune = useCallback((to) => {
     setCurrentId(to.id);
     if (!channel) {

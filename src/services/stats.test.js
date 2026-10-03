@@ -46,6 +46,8 @@ test('the funnel counts visits, not events, and keeps no visit ids anywhere else
   const stage = (event) => cmds(event, visit).filter(c => c[0] === 'PFADD' && c[1].startsWith('stats:funnel:')).map(c => c[1]);
   assert.deepEqual(stage({ name: 'Page view', data: { path: '/' } }), ['stats:funnel:visited:2026-09-23']);
   assert.deepEqual(stage({ name: 'Click', data: { target: 'tv-tune-in' } }), ['stats:funnel:clicked:2026-09-23']);
+  assert.deepEqual(stage({ name: 'Film opened', data: { film: 'x' } }), ['stats:funnel:clicked:2026-09-23'], 'opening a film is a click, however it was opened');
+  assert.deepEqual(stage({ name: 'Click', data: { target: 'film-card', film: 'x' } }), ['stats:funnel:clicked:2026-09-23']);
   assert.deepEqual(stage({ name: 'Play', data: { film: 'x', player: 'own' } }), ['stats:funnel:played:2026-09-23']);
   assert.deepEqual(stage({ name: 'TV', data: { action: 'tune', channel: 'atomic-age' } }), ['stats:funnel:tuned in:2026-09-23'], 'surfing channels is not pressing play on a film');
   assert.deepEqual(stage({ name: 'TV', data: { action: 'on-demand', channel: 'c-ab12', film: 'x' } }), ['stats:funnel:played:2026-09-23'], 'a film picked from a lineup is a play');

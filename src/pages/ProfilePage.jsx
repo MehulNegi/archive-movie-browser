@@ -80,7 +80,7 @@ export default function ProfilePage({ slug }) {
 
   return (
     <div className="min-h-screen">
-      <SiteHeader />
+      <SiteHeader current={`/u/${p.id}`} />
       <main className="gutter py-8 flex flex-col gap-8 text-bone">
         <div className="flex flex-col gap-3">
           {isOwner
@@ -112,7 +112,7 @@ export default function ProfilePage({ slug }) {
         )}
         <section>
           <h2 className="display text-xl mb-3">Favourites</h2>
-          <FilmGrid films={films} track="profile" saves />
+          <FilmGrid films={films} track="profile" />
         </section>
         {isOwner && (
           <section className="border border-line p-4">

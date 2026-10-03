@@ -1,10 +1,11 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import SiteHeader from '../layout/SiteHeader';
 import SiteFooter from '../layout/SiteFooter';
 import Button from '../ui/Button';
 import { FilmGrid, withPosters } from './ArchiveListPage';
 import { api, readProfile, editLink, readPrevious, switchBack } from '../services/profile';
 import { refreshProfile } from '../hooks/useProfile';
+import { protectProfile, listPasskeys, removePasskey, NEW_LINK } from '../services/passkey';
 
 const LABEL = { unlisted: 'Unlisted', submitted: 'In review', public: 'Public', featured: 'Featured' };
 const FIELD = 'bg-transparent border-b border-line text-bone w-full py-1';
@@ -19,10 +20,14 @@ export default function ProfilePage({ slug }) {
   const [manual, setManual] = useState(false); // the clipboard was not available
   const [copied, setCopied] = useState(false);
   const [failed, setFailed] = useState(false); // the last save did not go through
+  const [reserved, setReserved] = useState(false); // the name was refused as reserved
   const [reset, setReset] = useState(0); // remounts the inputs back to the stored values
   const me = readProfile();
   const isOwner = me?.id === slug;
   const previous = isOwner && readPrevious();
+  // A sign-in just replaced the edit key: show the new link, once
+  const [newLink] = useState(() => { try { return sessionStorage.getItem(NEW_LINK) === slug; } catch { return false; } });
+  useEffect(() => { if (newLink) { try { sessionStorage.removeItem(NEW_LINK); } catch { /* private mode */ } } }, [newLink]);
 
   const loads = useRef(0);
   const load = useCallback(() => {
@@ -53,10 +58,11 @@ export default function ProfilePage({ slug }) {
 
   const patch = body => api(`/api/profile/${slug}`, { method: 'PATCH', profile: me, body })
     .then(r => {
+      if (r.status === 400) return r.json().catch(() => ({})).then(d => { if (d.error !== 'reserved') throw new Error('save failed'); setFailed(false); setReserved(true); setReset(n => n + 1); });
       if (!r.ok) throw new Error('save failed');
-      setFailed(false); load(); refreshProfile();
+      setFailed(false); setReserved(false); load(); refreshProfile();
     })
-    .catch(() => { setFailed(true); setReset(n => n + 1); });
+    .catch(() => { setFailed(true); setReserved(false); setReset(n => n + 1); });
   const save = (field, e) => {
     const value = e.target.value.trim();
     if (value !== (p[field] || '')) patch({ [field]: value });
@@ -88,6 +94,7 @@ export default function ProfilePage({ slug }) {
             : <h1 className="display text-3xl break-words">{p.name || 'A profile'}</h1>}
           {isOwner && <input key={`a-${p.archiveUser}-${reset}`} defaultValue={p.archiveUser} maxLength={60} placeholder="Archive.org username (optional)" aria-label="Archive.org username" className={FIELD} onBlur={e => save('archiveUser', e)} />}
           {failed && <p role="alert" className="text-sm text-signal">Could not save</p>}
+          {reserved && <p role="alert" className="text-sm text-signal">That name is reserved.</p>}
           {p.archiveUser && <a className="nav-link" href={`/details/@${encodeURIComponent(p.archiveUser)}`}>@{p.archiveUser} on Archive.org</a>}
           <a className="nav-link hover:text-signal self-start" href={`mailto:${REPORT_TO}?subject=${encodeURIComponent('Report')}&body=${encodeURIComponent(window.location.href)}`}>Report</a>
         </div>
@@ -118,7 +125,8 @@ export default function ProfilePage({ slug }) {
           <section className="border border-line p-4">
             <h2 className="display text-xl">Your edit link</h2>
             <p className="text-sm mt-1">Open it on another device to edit there. Keep it private: anyone with it can edit your profile.</p>
-            {manual && (
+            {newLink && <p role="status" className="text-sm mt-2 text-signal">Signing in gave this profile a new edit link. The old one no longer works.</p>}
+            {(manual || newLink) && (
               <input readOnly value={link} aria-label="Your edit link" onFocus={e => e.target.select()}
                 className="mt-3 w-full bg-ink border border-line px-2 py-2 font-mono text-xs text-bone" />
             )}
@@ -130,8 +138,63 @@ export default function ProfilePage({ slug }) {
             )}
           </section>
         )}
+        {isOwner && <Passkeys profile={me} />}
       </main>
       <SiteFooter />
     </div>
+  );
+}
+
+const MAX_PASSKEYS = 5;
+const ADDED = { cancelled: 'No passkey added.', full: 'Five is the most.', exists: 'This device already has a passkey for this profile.', failed: "Couldn't add a passkey." };
+// The owner's passkeys: each signs in to this profile on any device that has it
+function Passkeys({ profile: { id, key } }) {
+  const profile = useMemo(() => ({ id, key }), [id, key]);
+  const [keys, setKeys] = useState(null);
+  const [state, setState] = useState(null); // busy | cancelled | full | exists | failed
+  const [confirm, setConfirm] = useState(null); // the passkey waiting for a second tap on Remove
+  const [removeFailed, setRemoveFailed] = useState(false);
+  const reload = useCallback(() => listPasskeys(profile).then(setKeys), [profile]);
+  useEffect(() => { reload(); }, [reload]);
+  const add = async () => {
+    setState('busy');
+    const out = await protectProfile(profile);
+    setState(out === 'ok' ? null : out);
+    reload();
+  };
+  const remove = async (credential) => {
+    setConfirm(null);
+    setRemoveFailed(!(await removePasskey(profile, credential)));
+    reload();
+  };
+  if (!keys) return null;
+  const full = keys.length >= MAX_PASSKEYS;
+  return (
+    <section className="border border-line p-4">
+      <h2 className="display text-xl">Passkeys</h2>
+      <p className="text-sm mt-1">Sign in to this profile on any device that has your passkey. Each sign-in replaces your edit link, so copy the new one afterwards.</p>
+      {keys.length > 0 && (
+        <ul className="mt-3 flex flex-col gap-1">
+          {keys.map(k => (
+            <li key={k.id} className="flex flex-wrap items-center gap-x-3">
+              <span>Passkey added {new Date(k.created).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}</span>
+              {confirm === k.id
+                ? <>
+                    <button type="button" className="nav-link text-signal hover:text-bone" onClick={() => remove(k.id)}>Remove it</button>
+                    <button type="button" className="nav-link" onClick={() => setConfirm(null)}>Keep</button>
+                  </>
+                : <button type="button" className="nav-link hover:text-signal" onClick={() => setConfirm(k.id)}>Remove</button>}
+            </li>
+          ))}
+        </ul>
+      )}
+      {removeFailed && <p role="alert" className="text-sm text-signal mt-2">Could not remove</p>}
+      {typeof window.PublicKeyCredential !== 'undefined' && (
+        <div className="mt-3">
+          <Button variant="ghost" onClick={add} disabled={full || state === 'busy'} className="disabled:opacity-50">Add a passkey</Button>
+          <p role="status" className="text-sm text-muted mt-2">{full ? ADDED.full : ADDED[state] || ''}</p>
+        </div>
+      )}
+    </section>
   );
 }
